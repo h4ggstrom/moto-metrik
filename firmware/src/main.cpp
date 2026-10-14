@@ -6,6 +6,8 @@
 #include <SD.h>
 #include <SPI.h>
 #include <TinyGPSPlus.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "config.h"
 
@@ -14,7 +16,9 @@ static SPIClass sdSpi(VSPI);
 static TinyGPSPlus gps;
 
 static File logFile;
+static char logPath[40];
 static bool sdOk = false;
+static bool clockSet = false;
 static uint32_t lastFlush = 0;
 static uint32_t bytesLogged = 0;
 
@@ -88,6 +92,8 @@ static void ubxSetBaud(uint32_t baud) {
   ubxSend(0x06, 0x00, p, sizeof(p));            // CFG-PRT
 }
 
+static void updateLed();
+
 // Listen for NMEA traffic at the current baud rate.
 static bool gpsTalking(uint32_t windowMs) {
   uint32_t start = millis();
@@ -98,6 +104,7 @@ static bool gpsTalking(uint32_t windowMs) {
       if (prev == '$' && c == 'G') return true;
       prev = c;
     }
+    updateLed();  // keep signalling while probing blocks the main loop
     delay(5);
   }
   return false;
@@ -113,15 +120,14 @@ static uint32_t gpsProbeBaud() {
   return 0;
 }
 
-static void gpsInit() {
-  gpsSerial.setRxBufferSize(4096);  // absorbs SD write latency spikes
-  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-
+// Find the GPS baud rate and push our settings. Also used to recover a GPS
+// that lost power mid-session: it then reboots on factory settings (9600 baud, 1 Hz).
+static bool gpsConfigure() {
   uint32_t baud = gpsProbeBaud();
   if (!baud) {
     Serial.println("[gps] no NMEA on any baud rate - check wiring (GPS TX -> GPIO16)");
-    gpsSerial.updateBaudRate(9600);
-    return;
+    gpsSerial.updateBaudRate(GPS_TARGET_BAUD);
+    return false;
   }
   Serial.printf("[gps] found NMEA at %u baud\n", baud);
 
@@ -148,6 +154,13 @@ static void gpsInit() {
   Serial.printf("[gps] rate %u ms: %s\n", GPS_RATE_MS, ackStr(ubxWaitAck(0x06, 0x08)));
   ubxSetDynamicModel(GPS_DYN_MODEL);
   Serial.printf("[gps] dynamic model %u: %s\n", GPS_DYN_MODEL, ackStr(ubxWaitAck(0x06, 0x24)));
+  return true;
+}
+
+static void gpsInit() {
+  gpsSerial.setRxBufferSize(4096);  // absorbs SD write latency spikes
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  gpsConfigure();
 }
 
 // ---------------------------------------------------------------------------
@@ -173,28 +186,162 @@ static void sdInit() {
   }
   Serial.printf("[sd] card %llu MB\n", SD.cardSize() / (1024 * 1024));
 
-  char path[24];
+  // Temporary name until the GPS gives the date (see syncClockAndRename).
   for (int i = 1; i < 10000; i++) {
-    snprintf(path, sizeof(path), "/log_%04d.nmea", i);
-    if (!SD.exists(path)) break;
+    snprintf(logPath, sizeof(logPath), "/log_%04d.nmea", i);
+    if (!SD.exists(logPath)) break;
   }
-  logFile = SD.open(path, FILE_WRITE);
+  logFile = SD.open(logPath, FILE_WRITE);
   if (!logFile) {
-    Serial.printf("[sd] cannot open %s\n", path);
+    Serial.printf("[sd] cannot open %s\n", logPath);
     return;
   }
   sdOk = true;
-  Serial.printf("[sd] logging to %s\n", path);
+  Serial.printf("[sd] logging to %s\n", logPath);
 }
 
 // ---------------------------------------------------------------------------
-// Status LED: fast blink = SD error, slow blink = waiting for fix, on = logging with fix
+// NMEA line filter: only complete sentences with a valid checksum reach the
+// SD card. A loose wire floods the UART with noise, which must not be logged.
+// ---------------------------------------------------------------------------
+
+static char nmeaLine[128];
+static size_t nmeaLen = 0;
+static uint32_t lastValidSentence = 0;  // millis() of the last valid sentence
+
+static int hexVal(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+static bool nmeaChecksumOk(const char *line, size_t len) {
+  // $<body>*HH
+  if (len < 4 || line[0] != '$') return false;
+  uint8_t sum = 0;
+  size_t i = 1;
+  for (; i < len && line[i] != '*'; i++) sum ^= (uint8_t)line[i];
+  if (i + 3 != len) return false;
+  int hi = hexVal(line[i + 1]), lo = hexVal(line[i + 2]);
+  return hi >= 0 && lo >= 0 && sum == (uint8_t)(hi << 4 | lo);
+}
+
+static void nmeaFeed(char c) {
+  if (c == '$') {  // start of sentence: drop any unfinished one
+    nmeaLen = 0;
+    nmeaLine[nmeaLen++] = c;
+    return;
+  }
+  if (nmeaLen == 0) return;  // outside a sentence (noise, UBX binary)
+  if (c == '\r') return;
+  if (c == '\n') {
+    if (nmeaChecksumOk(nmeaLine, nmeaLen)) {
+      lastValidSentence = millis();
+      if (sdOk) {
+        logFile.write((const uint8_t *)nmeaLine, nmeaLen);
+        logFile.write((const uint8_t *)"\r\n", 2);
+        bytesLogged += nmeaLen + 2;
+      }
+    }
+    nmeaLen = 0;
+    return;
+  }
+  if (c < 0x20 || c > 0x7E || nmeaLen >= sizeof(nmeaLine)) {
+    nmeaLen = 0;  // not text: noise
+    return;
+  }
+  nmeaLine[nmeaLen++] = c;
+}
+
+static bool gpsSilent() { return millis() - lastValidSentence > GPS_SILENT_MS; }
+
+// GPS silent for a while (wire came loose, GPS rebooted on factory settings):
+// probe and reconfigure it, retrying every GPS_RECOVER_MS.
+static void gpsWatchdog() {
+  static uint32_t lastAttempt = 0;
+  static bool reported = false;
+  if (!gpsSilent()) {
+    if (reported) Serial.println("[gps] back");
+    reported = false;
+    return;
+  }
+  if (!reported) {
+    Serial.printf("[gps] silent for %u ms\n", millis() - lastValidSentence);
+    reported = true;
+  }
+  if (millis() - lastAttempt < GPS_RECOVER_MS) return;
+  if (sdOk) logFile.flush();  // probing blocks for a few seconds
+  Serial.println("[gps] reconfiguring");
+  if (gpsConfigure()) lastValidSentence = millis();
+  lastAttempt = millis();
+}
+
+// ---------------------------------------------------------------------------
+// Clock: set the system time from the first GPS fix so FAT timestamps are
+// right, and rename the log after the boot time (local time), e.g.
+// /2026-10-14_13-51-20.nmea. FAT forbids ':' in names.
+// ---------------------------------------------------------------------------
+
+static void syncClockAndRename() {
+  if (clockSet) return;
+  // Date/time are also sent before a fix and can be wrong then: require a fix.
+  if (!gps.location.isValid() || gps.location.age() > 500 || !gps.date.isValid() ||
+      gps.date.year() < 2024 || gps.time.age() > 500)
+    return;
+
+  struct tm utc = {};
+  utc.tm_year = gps.date.year() - 1900;
+  utc.tm_mon = gps.date.month() - 1;
+  utc.tm_mday = gps.date.day();
+  utc.tm_hour = gps.time.hour();
+  utc.tm_min = gps.time.minute();
+  utc.tm_sec = gps.time.second();
+  setenv("TZ", "UTC0", 1);  // mktime() works in local time: convert as UTC
+  tzset();
+  time_t epoch = mktime(&utc);
+  setenv("TZ", LOG_TZ, 1);
+  tzset();
+
+  // Fix time + time elapsed since that sentence was parsed.
+  int64_t us = (int64_t)gps.time.centisecond() * 10000 + (int64_t)gps.time.age() * 1000;
+  struct timeval tv = {(time_t)(epoch + us / 1000000), (suseconds_t)(us % 1000000)};
+  settimeofday(&tv, nullptr);
+  clockSet = true;
+
+  time_t boot = epoch - (time_t)(millis() / 1000);
+  struct tm local;
+  localtime_r(&boot, &local);
+  char newPath[40];
+  strftime(newPath, sizeof(newPath), "/%Y-%m-%d_%H-%M-%S.nmea", &local);
+  Serial.printf("[clock] set from GPS: %04d-%02d-%02d %02d:%02d:%02d UTC\n", gps.date.year(), gps.date.month(),
+                gps.date.day(), gps.time.hour(), gps.time.minute(), gps.time.second());
+
+  if (!sdOk) return;
+  logFile.close();
+  if (!SD.exists(newPath) && SD.rename(logPath, newPath)) {
+    Serial.printf("[sd] renamed %s -> %s\n", logPath, newPath);
+    strlcpy(logPath, newPath, sizeof(logPath));
+  } else {
+    Serial.printf("[sd] rename to %s failed, keeping %s\n", newPath, logPath);
+  }
+  logFile = SD.open(logPath, FILE_APPEND);
+  if (!logFile) {
+    Serial.printf("[sd] cannot reopen %s\n", logPath);
+    sdOk = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Status LED: fast blink = SD error, double blink = no data from GPS,
+// slow blink = waiting for fix, on = logging with fix
 // ---------------------------------------------------------------------------
 
 static void updateLed() {
   uint32_t now = millis();
+  uint32_t phase = now % 1000;
   bool on;
   if (!sdOk) on = (now / 100) % 2;
+  else if (gpsSilent()) on = phase < 100 || (phase >= 200 && phase < 300);
   else if (!gps.location.isValid() || gps.location.age() > 2000) on = (now / 500) % 2;
   else on = true;
   digitalWrite(LED_PIN, on);
@@ -220,18 +367,18 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   delay(200);
   Serial.println("\n=== moto-metrik ===");
+  setenv("TZ", LOG_TZ, 1);
+  tzset();
   sdInit();
   gpsInit();
+  lastValidSentence = millis();  // grace period before the watchdog kicks in
 }
 
 void loop() {
   while (gpsSerial.available()) {
     char c = gpsSerial.read();
     gps.encode(c);
-    if (sdOk) {
-      logFile.write((uint8_t)c);
-      bytesLogged++;
-    }
+    nmeaFeed(c);
   }
 
   if (sdOk && millis() - lastFlush >= LOG_FLUSH_MS) {
@@ -239,6 +386,8 @@ void loop() {
     lastFlush = millis();
   }
 
+  gpsWatchdog();
+  syncClockAndRename();
   updateLed();
   printStatus();
 }

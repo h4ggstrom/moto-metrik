@@ -1,6 +1,6 @@
 # moto-metrik
 
-Boîtier télémétrique moto : ESP32 + GPS + carte SD. Le firmware écrit le NMEA brut sur la SD (un fichier `log_NNNN.nmea` par démarrage), l'analyse (tours, tracés, deltas) se fait sur PC.
+Boîtier télémétrique moto : ESP32 + GPS + carte SD. Le firmware écrit le NMEA brut sur la SD, un fichier par démarrage, nommé d'après l'heure de démarrage (`2026-10-14_15-02-33.nmea`, heure de Paris) dès le premier fix GPS ; il reste `log_NNNN.nmea` si aucun fix n'est obtenu, l'analyse (tours, tracés, deltas) se fait sur PC.
 
 ## Câblage
 
@@ -18,7 +18,9 @@ Boîtier télémétrique moto : ESP32 + GPS + carte SD. Le firmware écrit le NM
 Ne pas brancher le GPS sur RX0/TX0 : ces broches sont reliées au convertisseur USB-série (conflit upload/moniteur).
 Pins modifiables dans `firmware/include/config.h`.
 
-LED intégrée : clignote vite = erreur SD, lentement = attente fix GPS, fixe = enregistrement avec fix.
+LED intégrée : clignote vite = erreur SD, double clignotement = plus de données du GPS (fil débranché, GPS sans alim), lentement = attente fix GPS, fixe = enregistrement avec fix.
+
+Seules les trames NMEA complètes avec un checksum valide sont écrites. Si le GPS se tait plus de 2 s, le firmware le recherche et le reconfigure (10 Hz, modèle automobile) toutes les 5 s, ce qui couvre le GPS qui redémarre sur ses réglages d'usine après une coupure d'alim.
 
 ## Firmware
 

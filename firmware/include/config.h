@@ -13,7 +13,9 @@
 // Target settings pushed to u-blox modules (ignored by other chipsets).
 #define GPS_TARGET_BAUD 115200
 #define GPS_DYN_MODEL 4  // u-blox CFG-NAV5 dynModel: 4 = automotive
-#define GPS_RATE_MS 100  // 10 Hz (NEO-6M caps at 5 Hz -> it will reject and keep 1 Hz; use 200)
+#define GPS_RATE_MS 100
+#define GPS_SILENT_MS 2000   // no valid sentence for this long -> GPS considered lost
+#define GPS_RECOVER_MS 5000  // retry interval for re-probing/reconfiguring a lost GPS  // 10 Hz (NEO-6M caps at 5 Hz -> it will reject and keep 1 Hz; use 200)
 
 // ---------------------------------------------------------------------------
 // SD card (SPI) - native VSPI pins; GPIO21/22 stay free for the IMU (I2C)
@@ -23,6 +25,9 @@
 #define SD_MOSI_PIN 23
 #define SD_CS_PIN 5
 #define SD_SPI_FREQ 4000000
+
+// Local time zone for log file names and FAT timestamps (POSIX TZ: Paris).
+#define LOG_TZ "CET-1CEST,M3.5.0,M10.5.0/3"
 
 // Flush the log file this often so a power cut loses at most this much data.
 #define LOG_FLUSH_MS 1000

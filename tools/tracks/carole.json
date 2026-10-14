@@ -4,11 +4,11 @@
  "source": "Centerline from OpenStreetMap way 32693149 (c) OpenStreetMap contributors, ODbL",
  "length_m": 2073.7,
  "gate_width_m": 40,
- "_note": "start/finish and sector positions are PROVISIONAL (mid pit straight, thirds of the lap) - to calibrate against the real lines",
- "finish_m": 0,
+ "_note": "start/finish and sector lines calibrated to rider-provided coordinates (S/F 48.97909284,2.52276032; S1 48.97959411,2.52146957; S2 48.97987434,2.52004291)",
+ "finish_m": 4.5,
  "sectors_m": [
-  691,
-  1382
+  451.7,
+  1075.6
  ],
  "centerline": [
   [

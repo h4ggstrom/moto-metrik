@@ -37,7 +37,7 @@ python3 -m venv .venv && .venv/bin/pip install -r tools/requirements.txt
 .venv/bin/python tools/analyze.py /chemin/vers/log_0001.nmea --gate LAT,LON
 ```
 
-Les circuits de `tools/tracks/` (tracé OpenStreetMap + position de la ligne et des secteurs en mètres le long du tracé) sont détectés automatiquement : tours, secteurs et tour idéal sans option. Circuit Carole : ligne et secteurs **provisoires**, à caler sur les vraies lignes.
+Les circuits de `tools/tracks/` (tracé OpenStreetMap + position de la ligne et des secteurs en mètres le long du tracé) sont détectés automatiquement : tours, secteurs et tour idéal sans option. Circuit Carole : ligne de départ/arrivée et secteurs calés sur les vraies lignes.
 
 Hors circuit connu et sans `--gate`, la ligne est placée au point de vitesse max (cohérent pour comparer les tours, mais pas la vraie ligne). Sorties dans `out/<log>/` : `track.png`, `lean.png` (angle sur le tracé), `laps.png` (vitesse, angle et delta vs meilleur tour en fonction de la distance), `laps.csv`, `session.csv` (chaque point : vitesse, cap, angle, accélérations), `session.gpx`.
 

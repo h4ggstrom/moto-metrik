@@ -2,7 +2,7 @@
 """Analyse a moto-metrik NMEA log: lap splitting, lap times, traces.
 
 Usage:
-    python tools/analyze.py LOG.nmea                       # gate = point of max speed
+    python tools/analyze.py LOG.nmea                       # known track auto-detected, else gate = max speed
     python tools/analyze.py LOG.nmea --gate 47.2950,-0.5870  # explicit start/finish line
     python tools/analyze.py LOG.nmea --no-laps             # just plot the session
 
@@ -14,9 +14,10 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import json
 import math
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import matplotlib
@@ -156,39 +157,93 @@ class Lap:
     t_end: float
     i_start: int  # first fix index inside the lap
     i_end: int  # last fix index inside the lap
+    sectors: list[float | None] = field(default_factory=list)  # sector times, None if a gate was missed
 
     @property
     def time(self) -> float:
         return self.t_end - self.t_start
 
 
-def find_laps(x, y, t, gate_xy, gate_width: float, min_lap_s: float) -> list[float]:
-    """Return interpolated gate-crossing times (same direction as racing line)."""
-    gx, gy = gate_xy
-    # Racing direction at the gate = heading of the track near the closest fix.
+@dataclass
+class Gate:
+    """A virtual line across the track, crossed in direction (hx, hy)."""
+
+    name: str
+    x: float
+    y: float
+    hx: float
+    hy: float
+    width: float
+
+    @property
+    def ends(self):
+        half = self.width / 2
+        return ((self.x - self.hy * half, self.y + self.hx * half),
+                (self.x + self.hy * half, self.y - self.hx * half))
+
+
+def gate_from_trace(name: str, x, y, gx: float, gy: float, width: float) -> Gate:
+    """Gate at (gx, gy), perpendicular to the recorded trace near that point."""
     i0 = int(np.argmin((x - gx) ** 2 + (y - gy) ** 2))
     a, b = max(i0 - 2, 0), min(i0 + 2, len(x) - 1)
     hx, hy = x[b] - x[a], y[b] - y[a]
     n = math.hypot(hx, hy) or 1.0
-    hx, hy = hx / n, hy / n
-    # Gate segment is perpendicular to the heading.
-    half = gate_width / 2
-    q1 = (gx - hy * half, gy + hx * half)
-    q2 = (gx + hy * half, gy - hx * half)
+    return Gate(name, gx, gy, hx / n, hy / n, width)
 
+
+def gate_on_centerline(name: str, cx, cy, dist_m: float, width: float) -> Gate:
+    """Gate at dist_m along a closed centerline, perpendicular to it."""
+    xs, ys = np.append(cx, cx[0]), np.append(cy, cy[0])
+    seg = np.hypot(np.diff(xs), np.diff(ys))
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    d = dist_m % cum[-1]
+    i = min(int(np.searchsorted(cum, d, side="right")) - 1, len(seg) - 1)
+    u = (d - cum[i]) / seg[i]
+    return Gate(name, xs[i] + u * (xs[i + 1] - xs[i]), ys[i] + u * (ys[i + 1] - ys[i]),
+                (xs[i + 1] - xs[i]) / seg[i], (ys[i + 1] - ys[i]) / seg[i], width)
+
+
+def gate_crossings(x, y, t, gate: Gate, min_interval_s: float = 0.0) -> list[float]:
+    """Interpolated times at which the trace crosses the gate in its direction."""
+    q1, q2 = gate.ends
     crossings: list[float] = []
     for i in range(len(x) - 1):
         p1, p2 = (x[i], y[i]), (x[i + 1], y[i + 1])
         u = seg_intersect(p1, p2, q1, q2)
         if u is None:
             continue
-        if (p2[0] - p1[0]) * hx + (p2[1] - p1[1]) * hy <= 0:
+        if (p2[0] - p1[0]) * gate.hx + (p2[1] - p1[1]) * gate.hy <= 0:
             continue  # crossing backwards
         tc = t[i] + u * (t[i + 1] - t[i])
-        if crossings and tc - crossings[-1] < min_lap_s:
+        if crossings and tc - crossings[-1] < min_interval_s:
             continue
         crossings.append(tc)
     return crossings
+
+
+# ---------------------------------------------------------------------------
+# Track library
+# ---------------------------------------------------------------------------
+
+TRACKS_DIR = Path(__file__).parent / "tracks"
+
+
+def load_track(name: str) -> dict:
+    return json.loads((TRACKS_DIR / f"{name}.json").read_text())
+
+
+def detect_track(lat, lon, max_dist_m: float = 1000.0) -> str | None:
+    """Name of the library track the session's median position is closest to."""
+    mlat, mlon = float(np.median(lat)), float(np.median(lon))
+    best, best_d = None, max_dist_m
+    for path in sorted(TRACKS_DIR.glob("*.json")):
+        cl = np.array(json.loads(path.read_text())["centerline"])
+        proj = Projection(mlat, mlon)
+        cx, cy = proj(cl[:, 0], cl[:, 1])
+        d = float(np.min(np.hypot(cx, cy)))
+        if d < best_d:
+            best, best_d = path.stem, d
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -213,16 +268,22 @@ def write_gpx(path: Path, fixes: list[Fix]) -> None:
         f.write("</trkseg></trk></gpx>\n")
 
 
-def plot_track(path: Path, x, y, speed, laps: list[Lap], best: Lap | None, gate_xy) -> None:
+def plot_track(path: Path, x, y, speed, best: Lap | None, gates: list[Gate], outline, title: str) -> None:
     fig, ax = plt.subplots(figsize=(10, 10))
+    if outline is not None:
+        ox, oy = outline
+        ax.plot(np.append(ox, ox[0]), np.append(oy, oy[0]), color="0.6", lw=10, alpha=0.25, zorder=0,
+                solid_capstyle="round")
     ax.plot(x, y, color="0.85", lw=1, zorder=1)
     sel = slice(best.i_start, best.i_end + 1) if best else slice(None)
     sc = ax.scatter(x[sel], y[sel], c=speed[sel], cmap="turbo", s=6, zorder=2)
     fig.colorbar(sc, ax=ax, shrink=0.7, label="vitesse (km/h)")
-    if gate_xy is not None:
-        ax.plot(*gate_xy, marker="s", color="k", ms=8, zorder=3, label="ligne départ/arrivée")
-        ax.legend(loc="upper right")
-    title = f"Meilleur tour #{best.number} — {fmt_lap(best.time)}" if best else "Session complète"
+    for g in gates:
+        (x1, y1), (x2, y2) = g.ends
+        ax.plot([x1, x2], [y1, y2], color="k", lw=2, zorder=3)
+        ax.annotate(g.name, (x2, y2), fontsize=9, fontweight="bold", zorder=3)
+    if best:
+        title += f" — meilleur tour T{best.number} {fmt_lap(best.time)}"
     ax.set_title(title)
     ax.set_aspect("equal")
     ax.set_xlabel("x (m)")
@@ -272,7 +333,8 @@ def plot_laps(path: Path, laps: list[Lap], best: Lap, x, y, t, speed) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("log", type=Path)
-    ap.add_argument("--gate", help="start/finish line centre 'LAT,LON' (default: point of max speed)")
+    ap.add_argument("--track", help="track from tools/tracks/ (default: auto-detect, 'none' to disable)")
+    ap.add_argument("--gate", help="start/finish line centre 'LAT,LON' (overrides the track; default: point of max speed)")
     ap.add_argument("--gate-width", type=float, default=40.0, help="gate width in metres (default 40)")
     ap.add_argument("--min-lap", type=float, default=20.0, help="ignore crossings closer than N s (default 20)")
     ap.add_argument("--no-laps", action="store_true", help="skip lap detection")
@@ -300,41 +362,81 @@ def main() -> int:
     write_gpx(out_dir / "session.gpx", fixes)
 
     laps: list[Lap] = []
-    gate_xy = None
-    if not args.gate and speed.max() < 15:
+    gates: list[Gate] = []  # gates[0] = start/finish, then sector gates
+    outline = None
+    title = "Session complète"
+    track_name = None if args.gate else (args.track or detect_track(lat, lon))
+    if track_name == "none":
+        track_name = None
+    if track_name:
+        track = load_track(track_name)
+        cl = np.array(track["centerline"])
+        outline = proj(cl[:, 0], cl[:, 1])
+        width = track.get("gate_width_m", args.gate_width)
+        gates.append(gate_on_centerline("S/F", *outline, track["finish_m"], width))
+        for k, d in enumerate(track.get("sectors_m", []), start=1):
+            gates.append(gate_on_centerline(f"S{k}|S{k + 1}", *outline, track["finish_m"] + d, width))
+        title = track["name"]
+        print(f"[track] {track['name']} ({track['length_m']:.0f} m, {len(gates)} secteurs)")
+    elif args.gate:
+        glat, glon = (float(v) for v in args.gate.split(","))
+        gx, gy = proj(glat, glon)
+        gates.append(gate_from_trace("S/F", x, y, float(gx), float(gy), args.gate_width))
+    elif speed.max() < 15:
         print("[laps] vmax < 15 km/h: static/walking session, skipping auto lap detection (use --gate)")
-        args.no_laps = True
-    if not args.no_laps:
-        if args.gate:
-            glat, glon = (float(v) for v in args.gate.split(","))
-            gx, gy = proj(glat, glon)
-            gate_xy = (float(gx), float(gy))
-        else:
-            i = int(np.argmax(speed))
-            gate_xy = (float(x[i]), float(y[i]))
-            print(f"[laps] auto gate at max speed point {lat[i]:.6f},{lon[i]:.6f} "
-                  f"(pass --gate for the real start/finish line)")
-        crossings = find_laps(x, y, t, gate_xy, args.gate_width, args.min_lap)
+    else:
+        i = int(np.argmax(speed))
+        gates.append(gate_from_trace("S/F", x, y, float(x[i]), float(y[i]), args.gate_width))
+        print(f"[laps] auto gate at max speed point {lat[i]:.6f},{lon[i]:.6f} "
+              f"(pass --gate for the real start/finish line)")
+    if args.no_laps:
+        gates = []
+
+    if gates:
+        crossings = gate_crossings(x, y, t, gates[0], args.min_lap)
+        sector_cross = [gate_crossings(x, y, t, g) for g in gates[1:]]
         for n, (a, b) in enumerate(zip(crossings, crossings[1:]), start=1):
             ia = int(np.searchsorted(t, a))
             ib = int(np.searchsorted(t, b)) - 1
-            laps.append(Lap(n, a, b, ia, ib))
+            lap = Lap(n, a, b, ia, ib)
+            if sector_cross:
+                # One crossing of each sector gate, in order, inside the lap.
+                marks = [a]
+                for sc in sector_cross:
+                    inside = [c for c in sc if marks[-1] < c < b]
+                    marks.append(inside[0] if inside else None)
+                marks.append(b)
+                if None in marks:
+                    lap.sectors = [None] * (len(marks) - 1)
+                else:
+                    lap.sectors = list(np.diff(marks))
+            laps.append(lap)
 
     best = min(laps, key=lambda l: l.time) if laps else None
-    plot_track(out_dir / "track.png", x, y, speed, laps, best, gate_xy)
+    plot_track(out_dir / "track.png", x, y, speed, best, gates, outline, title)
 
     if laps:
+        n_sec = len(laps[0].sectors)
+        best_sec = [min((l.sectors[k] for l in laps if l.sectors[k] is not None), default=None)
+                    for k in range(n_sec)]
         with open(out_dir / "laps.csv", "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["lap", "time_s", "time", "vmax_kmh", "gap_to_best_s"])
+            w.writerow(["lap", "time_s", "time", *[f"S{k + 1}_s" for k in range(n_sec)], "vmax_kmh", "gap_to_best_s"])
             for lap in laps:
                 vmax = speed[lap.i_start : lap.i_end + 1].max()
-                w.writerow([lap.number, f"{lap.time:.3f}", fmt_lap(lap.time), f"{vmax:.1f}",
+                secs = ["" if s_ is None else f"{s_:.3f}" for s_ in lap.sectors]
+                w.writerow([lap.number, f"{lap.time:.3f}", fmt_lap(lap.time), *secs, f"{vmax:.1f}",
                             f"{lap.time - best.time:.3f}"])
+                sec_txt = "  ".join(
+                    "   --   " if s_ is None else f"{s_:7.3f}{'*' if s_ == best_sec[k] else ' '}"
+                    for k, s_ in enumerate(lap.sectors))
                 mark = "  ★" if lap is best else f"  +{lap.time - best.time:.3f}"
-                print(f"  T{lap.number:<3} {fmt_lap(lap.time)}  vmax {vmax:5.1f} km/h{mark}")
+                print(f"  T{lap.number:<3} {fmt_lap(lap.time)}  {sec_txt}  vmax {vmax:5.1f} km/h{mark}")
+        if n_sec and None not in best_sec:
+            print(f"  tour idéal (meilleurs secteurs) : {fmt_lap(sum(best_sec))}  "
+                  f"(-{best.time - sum(best_sec):.3f} vs meilleur tour)")
         plot_laps(out_dir / "laps.png", laps, best, x, y, t, speed)
-    elif not args.no_laps:
+    elif gates:
         print("[laps] no complete lap found")
 
     print(f"[out] {out_dir}/")

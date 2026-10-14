@@ -12,6 +12,7 @@
 
 // Target settings pushed to u-blox modules (ignored by other chipsets).
 #define GPS_TARGET_BAUD 115200
+#define GPS_DYN_MODEL 4  // u-blox CFG-NAV5 dynModel: 4 = automotive
 #define GPS_RATE_MS 100  // 10 Hz (NEO-6M caps at 5 Hz -> it will reject and keep 1 Hz; use 200)
 
 // ---------------------------------------------------------------------------

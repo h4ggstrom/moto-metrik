@@ -36,6 +36,29 @@ static void ubxSend(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t le
   delay(50);
 }
 
+// Wait for UBX-ACK-ACK / ACK-NAK for a CFG message. 1 = ACK, 0 = NAK, -1 = timeout.
+static int ubxWaitAck(uint8_t cls, uint8_t id, uint32_t timeoutMs = 500) {
+  const uint8_t hdr[] = {0xB5, 0x62, 0x05};
+  uint8_t buf[8];
+  uint8_t n = 0;
+  uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    while (gpsSerial.available()) {
+      uint8_t b = gpsSerial.read();
+      if (n < 3 && b != hdr[n]) { n = (b == 0xB5); if (n) buf[0] = b; continue; }
+      buf[n++] = b;
+      if (n == 8) {  // B5 62 05 ackId 02 00 cls id
+        if (buf[6] == cls && buf[7] == id) return buf[3] == 0x01 ? 1 : 0;
+        n = 0;
+      }
+    }
+    delay(2);
+  }
+  return -1;
+}
+
+static const char *ackStr(int r) { return r == 1 ? "ACK" : r == 0 ? "NAK" : "no reply"; }
+
 static void ubxDisableNmea(uint8_t msgId) {
   const uint8_t p[] = {0xF0, msgId, 0};
   ubxSend(0x06, 0x01, p, sizeof(p));  // CFG-MSG
@@ -44,6 +67,15 @@ static void ubxDisableNmea(uint8_t msgId) {
 static void ubxSetRate(uint16_t ms) {
   const uint8_t p[] = {(uint8_t)(ms & 0xFF), (uint8_t)(ms >> 8), 1, 0, 1, 0};
   ubxSend(0x06, 0x08, p, sizeof(p));  // CFG-RATE
+}
+
+// Navigation filter dynamics: the default "portable" model over-smooths
+// speed/course at track dynamics.
+static void ubxSetDynamicModel(uint8_t model) {
+  uint8_t p[36] = {0};
+  p[0] = 0x01;     // mask: apply dynModel only
+  p[2] = model;
+  ubxSend(0x06, 0x24, p, sizeof(p));  // CFG-NAV5
 }
 
 static void ubxSetBaud(uint32_t baud) {
@@ -111,7 +143,11 @@ static void gpsInit() {
     }
   }
 
+  while (gpsSerial.available()) gpsSerial.read();
   ubxSetRate(GPS_RATE_MS);
+  Serial.printf("[gps] rate %u ms: %s\n", GPS_RATE_MS, ackStr(ubxWaitAck(0x06, 0x08)));
+  ubxSetDynamicModel(GPS_DYN_MODEL);
+  Serial.printf("[gps] dynamic model %u: %s\n", GPS_DYN_MODEL, ackStr(ubxWaitAck(0x06, 0x24)));
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +156,18 @@ static void gpsInit() {
 
 static void sdInit() {
   sdSpi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-  if (!SD.begin(SD_CS_PIN, sdSpi, SD_SPI_FREQ)) {
+  // After a soft reset (flash, brownout) the card keeps power and can be stuck
+  // mid-transaction: retry, it usually answers on the second attempt.
+  bool mounted = false;
+  for (int attempt = 1; attempt <= 5 && !mounted; attempt++) {
+    mounted = SD.begin(SD_CS_PIN, sdSpi, SD_SPI_FREQ);
+    if (!mounted) {
+      Serial.printf("[sd] mount attempt %d failed\n", attempt);
+      SD.end();
+      delay(200);
+    }
+  }
+  if (!mounted) {
     Serial.println("[sd] mount failed");
     return;
   }

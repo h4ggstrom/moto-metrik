@@ -150,6 +150,44 @@ def seg_intersect(p1, p2, q1, q2):
     return u if 0 <= u <= 1 and 0 <= v <= 1 else None
 
 
+G = 9.81
+
+
+def smooth(a, n: int):
+    """Centered moving average over n samples (odd), edges padded."""
+    if n <= 1:
+        return a
+    k = n // 2
+    return np.convolve(np.pad(a, k, mode="edge"), np.ones(n) / n, mode="valid")
+
+
+def dynamics(t, speed_kmh, course_deg, min_speed_kmh: float = 15.0, window: int = 5):
+    """Lean angle (deg, + = right), lateral and longitudinal acceleration (g).
+
+    Steady-turn model: a_lat = v * yaw_rate, tan(lean) = a_lat / g. Yaw rate
+    comes from the GPS course over ground (Doppler-based, far less noisy than
+    differentiating positions). This is the lean of an ideal thin-tyre bike
+    with the rider in line: real bike lean is a few degrees more (tyre width),
+    less if the rider hangs off.
+    """
+    v = speed_kmh / 3.6
+    course = np.asarray(course_deg, dtype=float)
+    ok = np.isfinite(course)
+    if ok.sum() < 2:
+        nan = np.full_like(v, np.nan)
+        return nan, nan, nan
+    course = np.interp(t, t[ok], course[ok])
+    heading = smooth(np.unwrap(np.radians(course)), window)
+    yaw_rate = np.gradient(heading, t)
+    a_lat = smooth(v * yaw_rate, window)
+    a_lon = smooth(np.gradient(smooth(v, window), t), window)
+    lean = np.degrees(np.arctan2(a_lat, G))
+    slow = speed_kmh < min_speed_kmh  # course is meaningless when (nearly) stopped
+    lean[slow] = np.nan
+    a_lat[slow] = np.nan
+    return lean, a_lat / G, a_lon / G
+
+
 @dataclass
 class Lap:
     number: int
@@ -302,8 +340,9 @@ def lap_profile(lap: Lap, x, y, t, speed):
     return d, lt - lap.t_start, lv
 
 
-def plot_laps(path: Path, laps: list[Lap], best: Lap, x, y, t, speed) -> None:
-    fig, (ax_v, ax_d) = plt.subplots(2, 1, figsize=(14, 9), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
+def plot_laps(path: Path, laps: list[Lap], best: Lap, x, y, t, speed, lean) -> None:
+    fig, (ax_v, ax_l, ax_d) = plt.subplots(3, 1, figsize=(14, 12), sharex=True,
+                                           gridspec_kw={"height_ratios": [2, 1.3, 1]})
     bd, bt, _ = lap_profile(best, x, y, t, speed)
     cmap = plt.get_cmap("tab10")
     for k, lap in enumerate(laps):
@@ -312,19 +351,54 @@ def plot_laps(path: Path, laps: list[Lap], best: Lap, x, y, t, speed) -> None:
         style = dict(lw=2.2 if is_best else 1, alpha=1 if is_best else 0.7, color="k" if is_best else cmap(k % 10))
         label = f"T{lap.number} {fmt_lap(lap.time)}" + (" ★" if is_best else "")
         ax_v.plot(d, v, label=label, **style)
+        ax_l.plot(d, lean[lap.i_start : lap.i_end + 1], **style)
         if not is_best:
             # Delta vs best lap at equal distance (positive = slower than best).
             ax_d.plot(d, lt - np.interp(d, bd, bt), **style)
     ax_d.axhline(0, color="k", lw=1)
+    ax_l.axhline(0, color="k", lw=1)
+    ax_l.set_ylabel("angle estimé (°)\n← gauche | droite →")
     ax_v.set_ylabel("vitesse (km/h)")
     ax_d.set_ylabel("delta vs meilleur (s)")
     ax_d.set_xlabel("distance depuis la ligne (m)")
     ax_v.legend(ncol=4, fontsize=8)
-    for ax in (ax_v, ax_d):
+    for ax in (ax_v, ax_l, ax_d):
         ax.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
+
+
+def plot_lean(path: Path, x, y, lean, best: Lap | None, outline, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(10, 10))
+    if outline is not None:
+        ox, oy = outline
+        ax.plot(np.append(ox, ox[0]), np.append(oy, oy[0]), color="0.6", lw=10, alpha=0.25, zorder=0)
+    sel = slice(best.i_start, best.i_end + 1) if best else slice(None)
+    lim = max(10.0, float(np.nanpercentile(np.abs(lean[sel]), 99)))
+    sc = ax.scatter(x[sel], y[sel], c=lean[sel], cmap="RdBu_r", vmin=-lim, vmax=lim, s=6, zorder=2)
+    fig.colorbar(sc, ax=ax, shrink=0.7, label="angle estimé (°)  ← gauche | droite →")
+    ax.set_title(title + (f" — angle, tour T{best.number}" if best else " — angle"))
+    ax.set_aspect("equal")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def write_session_csv(path: Path, fixes: list[Fix], laps: list[Lap], lean, a_lat, a_lon) -> None:
+    lap_of = np.zeros(len(fixes), dtype=int)
+    for lap in laps:
+        lap_of[lap.i_start : lap.i_end + 1] = lap.number
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["utc", "lap", "lat", "lon", "speed_kmh", "course_deg", "lean_deg", "a_lat_g", "a_lon_g",
+                    "sats", "hdop"])
+        for i, fx in enumerate(fixes):
+            ts = dt.datetime.fromtimestamp(fx.t, dt.timezone.utc).strftime("%H:%M:%S.%f")[:-4]
+            w.writerow([ts, lap_of[i], f"{fx.lat:.7f}", f"{fx.lon:.7f}", f"{fx.speed_kmh:.2f}",
+                        f"{fx.course:.2f}", f"{lean[i]:.1f}", f"{a_lat[i]:.3f}", f"{a_lon[i]:.3f}",
+                        fx.sats, fx.hdop])
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +426,7 @@ def main() -> int:
     speed = np.array([f.speed_kmh for f in fixes])
     proj = Projection(lat.mean(), lon.mean())
     x, y = proj(lat, lon)
+    lean, a_lat, a_lon = dynamics(t, speed, np.array([f.course for f in fixes]))
 
     dts = np.diff(t)
     print(f"[session] {len(fixes)} fixes, {fmt_lap(t[-1] - t[0])} long, "
@@ -414,6 +489,8 @@ def main() -> int:
 
     best = min(laps, key=lambda l: l.time) if laps else None
     plot_track(out_dir / "track.png", x, y, speed, best, gates, outline, title)
+    plot_lean(out_dir / "lean.png", x, y, lean, best, outline, title)
+    write_session_csv(out_dir / "session.csv", fixes, laps, lean, a_lat, a_lon)
 
     if laps:
         n_sec = len(laps[0].sectors)
@@ -421,24 +498,33 @@ def main() -> int:
                     for k in range(n_sec)]
         with open(out_dir / "laps.csv", "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["lap", "time_s", "time", *[f"S{k + 1}_s" for k in range(n_sec)], "vmax_kmh", "gap_to_best_s"])
+            w.writerow(["lap", "time_s", "time", *[f"S{k + 1}_s" for k in range(n_sec)], "vmax_kmh",
+                        "lean_left_deg", "lean_right_deg", "brake_max_g", "gap_to_best_s"])
             for lap in laps:
-                vmax = speed[lap.i_start : lap.i_end + 1].max()
+                sl = slice(lap.i_start, lap.i_end + 1)
+                vmax = speed[sl].max()
+                lean_l, lean_r = -np.nanmin(lean[sl]), np.nanmax(lean[sl])
+                brake = -np.nanmin(a_lon[sl])
                 secs = ["" if s_ is None else f"{s_:.3f}" for s_ in lap.sectors]
                 w.writerow([lap.number, f"{lap.time:.3f}", fmt_lap(lap.time), *secs, f"{vmax:.1f}",
-                            f"{lap.time - best.time:.3f}"])
+                            f"{lean_l:.1f}", f"{lean_r:.1f}", f"{brake:.2f}", f"{lap.time - best.time:.3f}"])
                 sec_txt = "  ".join(
                     "   --   " if s_ is None else f"{s_:7.3f}{'*' if s_ == best_sec[k] else ' '}"
                     for k, s_ in enumerate(lap.sectors))
                 mark = "  ★" if lap is best else f"  +{lap.time - best.time:.3f}"
-                print(f"  T{lap.number:<3} {fmt_lap(lap.time)}  {sec_txt}  vmax {vmax:5.1f} km/h{mark}")
+                print(f"  T{lap.number:<3} {fmt_lap(lap.time)}  {sec_txt}  vmax {vmax:5.1f} km/h  "
+                      f"angle G/D {lean_l:4.1f}°/{lean_r:4.1f}°  frein {brake:.2f}g{mark}")
         if n_sec and None not in best_sec:
             print(f"  tour idéal (meilleurs secteurs) : {fmt_lap(sum(best_sec))}  "
                   f"(-{best.time - sum(best_sec):.3f} vs meilleur tour)")
-        plot_laps(out_dir / "laps.png", laps, best, x, y, t, speed)
+        plot_laps(out_dir / "laps.png", laps, best, x, y, t, speed, lean)
     elif gates:
         print("[laps] no complete lap found")
 
+    if np.isfinite(lean).any():
+        print(f"[dyn] angle max G/D {-np.nanmin(lean):.1f}°/{np.nanmax(lean):.1f}°, "
+              f"a_lat max {np.nanmax(np.abs(a_lat)):.2f} g, freinage max {-np.nanmin(a_lon):.2f} g, "
+              f"accel max {np.nanmax(a_lon):.2f} g")
     print(f"[out] {out_dir}/")
     return 0
 

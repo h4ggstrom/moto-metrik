@@ -4,16 +4,29 @@ Boîtier télémétrique moto : ESP32 + GPS + carte SD. Le firmware écrit le NM
 
 ## Câblage
 
-| Module | Broche module | ESP32 |
-|---|---|---|
-| GPS | VCC / GND | 3V3 / GND |
-| GPS | TX | GPIO16 (RX2) |
-| GPS | RX | GPIO17 (TX2) |
-| SD | VCC / GND | VIN (5 V) / GND |
-| SD | MISO | GPIO19 |
-| SD | MOSI | GPIO23 |
-| SD | SCK | GPIO18 |
-| SD | CS | GPIO5 |
+Le GPS et l'IMU partagent le 3V3 et un GND (épissures en Y soudées, une seule fiche Dupont femelle sur la broche ESP32). La SD a son alimentation à part.
+
+| Module | Broche module | Fil | ESP32 |
+|---|---|---|---|
+| GPS | VCC | rouge | 3V3 (Y partagé avec IMU VCC) |
+| GPS | GND | noir | GND n° 1 (Y partagé avec IMU GND) |
+| GPS | TX | bleu | GPIO16 (RX2) |
+| GPS | RX | violet | GPIO17 (TX2) |
+| IMU | VCC | rouge | 3V3 (Y partagé avec GPS VCC) |
+| IMU | GND | noir | GND n° 1 (Y partagé avec GPS GND) |
+| IMU | SCLK (SCL) | blanc | GPIO22 |
+| IMU | SDI (SDA) | marron | GPIO21 |
+| IMU | NCS | gris | GPIO4 (piloté à l'état haut : mode I2C) |
+| IMU | SDO (AD0) | orange | GPIO26 (piloté à l'état bas : adresse 0x68) |
+| IMU | FSY | vert | GPIO25 (piloté à l'état bas) |
+| IMU | INT | jaune | GPIO27 (pas encore utilisé) |
+| IMU | ACL / ADA | — | non branchés |
+| SD | VCC | rouge | VIN (5 V) |
+| SD | GND | noir | GND n° 2 |
+| SD | MISO | orange | GPIO19 |
+| SD | MOSI | marron | GPIO23 |
+| SD | SCK | blanc | GPIO18 |
+| SD | CS | gris | GPIO5 |
 
 Ne pas brancher le GPS sur RX0/TX0 : ces broches sont reliées au convertisseur USB-série (conflit upload/moniteur).
 Pins modifiables dans `firmware/include/config.h`.

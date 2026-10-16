@@ -19,7 +19,8 @@
 body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, -apple-system, sans-serif; }
 header { position: sticky; top: 0; z-index: 2; background: var(--card); border-bottom: 1px solid var(--line);
          padding: 10px 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-header h1 { font-size: 17px; margin: 0; flex: 1; }
+header h1 { font-size: 16px; margin: 0; flex: 1 0 100%; }
+@media (min-width: 520px) { header h1 { flex: 1; } }
 .pill { font-size: 12px; padding: 3px 8px; border-radius: 99px; background: var(--bg); color: var(--muted); white-space: nowrap; }
 .pill.ok { color: var(--ok); } .pill.bad { color: var(--bad); }
 main { padding: 12px 16px 40px; max-width: 900px; margin: 0 auto; }
@@ -40,12 +41,13 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .stat span { font-size: 12px; color: var(--muted); }
 .scroll { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 14px; }
-th, td { padding: 6px 8px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th, td { padding: 6px 6px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
 th:first-child, td:first-child { text-align: left; }
 th { font-size: 12px; color: var(--muted); font-weight: 500; }
 td.best { color: var(--best); font-weight: 700; }
 tr.sel td { background: var(--bg); }
 canvas { width: 100%; display: block; }
+@media (max-width: 480px) { table { font-size: 13px; } th, td { padding: 5px 4px; } th { font-size: 11px; } }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
 .chip { font-size: 13px; padding: 4px 10px; border-radius: 99px; border: 1px solid var(--line); cursor: pointer; user-select: none; }
 .chip.on { border-color: currentColor; font-weight: 600; }
@@ -105,12 +107,19 @@ async function refreshStatus() {
   }
 }
 
+let showAll = false;
 async function loadFiles() {
   try {
     const files = await (await api("/api/files")).json();
-    files.sort((a, b) => b.name.localeCompare(a.name));
-    $("#files-msg").textContent = files.length ? "" : "Aucune session sur la carte.";
-    $("#files").innerHTML = files.map(f =>
+    const dated = f => /^\d{4}-/.test(f.name);
+    files.sort((a, b) => (dated(b) - dated(a)) || b.name.localeCompare(a.name));
+    const small = files.filter(f => f.size < 100e3).length;
+    const shown = showAll ? files : files.filter(f => f.size >= 100e3);
+    $("#files-msg").innerHTML = !files.length ? "Aucune session sur la carte." :
+      small ? `<a href="#" id="toggle-small">${showAll ? "Masquer" : "Afficher"} les ${small} fichiers de moins de 100 Ko</a>` : "";
+    const t = $("#toggle-small");
+    if (t) t.onclick = e => { e.preventDefault(); showAll = !showAll; loadFiles(); };
+    $("#files").innerHTML = shown.map(f =>
       `<li data-name="${esc(f.name)}"><span>${esc(f.name.replace(".nmea", "").replace("_", " "))}</span>` +
       `<span class="muted">${(f.size / 1e6).toFixed(1)} Mo</span></li>`).join("");
     for (const li of document.querySelectorAll("#files li")) li.onclick = () => openRemote(li.dataset.name, li);
@@ -169,12 +178,14 @@ function render(name) {
 
   if (R.laps.length || R.partial.length) h += lapsCard();
   h += `<div class="card"><h2>Tracé</h2><canvas id="map"></canvas></div>`;
-  if (R.laps.length) h += `<div class="card"><h2>Vitesse et angle par tour</h2><div class="chips" id="chips"></div><canvas id="chart"></canvas></div>`;
+  h += R.laps.length
+    ? `<div class="card"><h2>Vitesse et angle par tour</h2><div class="chips" id="chips"></div><canvas id="chart"></canvas></div>`
+    : `<div class="card"><h2>Vitesse et angle (session)</h2><canvas id="chart"></canvas></div>`;
   if (R.corners.length) h += cornersCard();
   $("#report").innerHTML = h;
   if (R.laps.length) renderChips();
   drawMap();
-  if (R.laps.length) drawChart();
+  drawChart();
   const sel = $("#corner-lap");
   if (sel) sel.onchange = () => { cornerLap = +sel.value; render(name); };
 }
@@ -278,7 +289,7 @@ function drawMap() {
   for (const g of R.gates) {
     const h2 = g.width / 2, a = P(g.x - g.hy * h2, g.y + g.hx * h2), b = P(g.x + g.hy * h2, g.y - g.hx * h2);
     ctx.beginPath(); ctx.moveTo(...a); ctx.lineTo(...b); ctx.stroke();
-    ctx.fillText(g.name, b[0] + 3, b[1]);
+    ctx.fillText(g.name, b[0] + 4, b[1] + (b[1] > a[1] ? 12 : -4));
   }
   if (R.track && R.track.corners && R.outline) {
     ctx.font = "12px system-ui"; ctx.textAlign = "center"; ctx.fillStyle = css("--muted");
@@ -304,6 +315,12 @@ function drawMap() {
   }
 }
 
+function sessionProfile() {  // no complete lap: whole session against time
+  const d = [], v = [], lean = [];
+  for (let i = 0; i < R.n; i++) { d.push(R.t[i] - R.t[0]); v.push(R.speed[i]); lean.push(R.lean[i]); }
+  return { d, v, lean };
+}
+
 function lapProfile(l) {
   const d = [0], v = [], lean = [];
   for (let i = l.i0; i <= l.i1; i++) {
@@ -316,9 +333,10 @@ function lapProfile(l) {
 function drawChart() {
   const cv = $("#chart");
   const [ctx, w, h] = setupCanvas(cv, 0.75);
-  const laps = R.laps.filter(l => shownLaps.has(l.number));
+  const byTime = !R.laps.length;
+  const laps = byTime ? [{ number: 0 }] : R.laps.filter(l => shownLaps.has(l.number));
   if (!laps.length) return;
-  const profs = laps.map(lapProfile);
+  const profs = byTime ? [sessionProfile()] : laps.map(lapProfile);
   const dmax = Math.max(...profs.map(p => p.d[p.d.length - 1]));
   const vmax = Math.ceil(Math.max(...profs.map(p => Math.max(...p.v))) / 20) * 20;
   const left = 34, right = 8, h1 = h * 0.62, top2 = h1 + 18, h2 = h - top2 - 18;
@@ -335,8 +353,9 @@ function drawChart() {
   }
   ctx.fillText("km/h", left + 4, 12);
   ctx.fillText("angle (GPS)  ← gauche · droite →", left + 4, top2 - 4);
-  // corner bands
-  if (R.track && R.track.corners) {
+  if (byTime) ctx.fillText("temps (s)", w - right - 52, h - 2);
+  // corner bands (distance axis only)
+  if (!byTime && R.track && R.track.corners) {
     ctx.fillStyle = css("--muted"); ctx.globalAlpha = 0.12;
     for (const c of R.track.corners) ctx.fillRect(X(c.start_m), 0, X(c.end_m) - X(c.start_m), h - 14);
     ctx.globalAlpha = 1;
@@ -344,7 +363,7 @@ function drawChart() {
   }
   laps.forEach((l, k) => {
     const p = profs[k];
-    ctx.strokeStyle = lapColor(l); ctx.lineWidth = l === R.best ? 2.2 : 1.4;
+    ctx.strokeStyle = byTime ? css("--accent") : lapColor(l); ctx.lineWidth = l === R.best ? 2.2 : 1.4;
     ctx.beginPath();
     p.d.forEach((d, i) => { const y = h1 - (h1 - 6) * p.v[i] / vmax; i ? ctx.lineTo(X(d), y) : ctx.moveTo(X(d), y); });
     ctx.stroke();
@@ -361,7 +380,7 @@ function drawChart() {
   });
 }
 
-window.addEventListener("resize", () => { if (R && !R.error) { drawMap(); if (R.laps.length) drawChart(); } });
+window.addEventListener("resize", () => { if (R && !R.error) { drawMap(); drawChart(); } });
 refreshStatus(); loadFiles();
 setInterval(refreshStatus, 3000);
 </script>

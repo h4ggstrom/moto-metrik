@@ -10,6 +10,56 @@
   451.7,
   1075.6
  ],
+ "corners": [
+  {
+   "name": "Alpha",
+   "dir": "G",
+   "start_m": 205,
+   "end_m": 290
+  },
+  {
+   "name": "Bravo",
+   "dir": "GD",
+   "start_m": 345,
+   "end_m": 425
+  },
+  {
+   "name": "Charlie",
+   "dir": "DD",
+   "start_m": 478,
+   "end_m": 580
+  },
+  {
+   "name": "Delta",
+   "dir": "GG",
+   "start_m": 580,
+   "end_m": 676
+  },
+  {
+   "name": "Echo",
+   "dir": "D",
+   "start_m": 715,
+   "end_m": 800
+  },
+  {
+   "name": "Foxtrot",
+   "dir": "D",
+   "start_m": 800,
+   "end_m": 945
+  },
+  {
+   "name": "Golf",
+   "dir": "D",
+   "start_m": 1365,
+   "end_m": 1435
+  },
+  {
+   "name": "Hotel",
+   "dir": "D",
+   "start_m": 1895,
+   "end_m": 1985
+  }
+ ],
  "centerline": [
   [
    48.9790525,

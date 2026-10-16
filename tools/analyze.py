@@ -161,6 +161,14 @@ def smooth(a, n: int):
     return np.convolve(np.pad(a, k, mode="edge"), np.ones(n) / n, mode="valid")
 
 
+def median(a, n: int):
+    """Centered running median over n samples (odd), edges padded."""
+    if n <= 1:
+        return a
+    k = n // 2
+    return np.median(np.lib.stride_tricks.sliding_window_view(np.pad(a, k, mode="edge"), n), axis=1)
+
+
 def dynamics(t, speed_kmh, course_deg, min_speed_kmh: float = 15.0, window: int = 5):
     """Lean angle (deg, + = right), lateral and longitudinal acceleration (g).
 
@@ -178,7 +186,7 @@ def dynamics(t, speed_kmh, course_deg, min_speed_kmh: float = 15.0, window: int 
         return nan, nan, nan
     course = np.interp(t, t[ok], course[ok])
     heading = smooth(np.unwrap(np.radians(course)), window)
-    yaw_rate = np.gradient(heading, t)
+    yaw_rate = median(np.gradient(heading, t), window)  # kills single-epoch course spikes
     a_lat = smooth(v * yaw_rate, window)
     a_lon = smooth(np.gradient(smooth(v, window), t), window)
     lean = np.degrees(np.arctan2(a_lat, G))
@@ -284,6 +292,84 @@ def detect_track(lat, lon, max_dist_m: float = 1000.0) -> str | None:
     return best
 
 
+
+# ---------------------------------------------------------------------------
+# Corners
+# ---------------------------------------------------------------------------
+
+
+def track_progress(x, y, cx, cy, offset_m: float):
+    """Distance along the closed centerline (0 = start/finish) of each fix."""
+    xs, ys = np.append(cx, cx[0]), np.append(cy, cy[0])
+    ax, ay = xs[:-1], ys[:-1]
+    dx, dy = np.diff(xs), np.diff(ys)
+    seg = np.hypot(dx, dy)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    length = cum[-1]
+    px, py = np.asarray(x)[:, None], np.asarray(y)[:, None]
+    u = np.clip(((px - ax) * dx + (py - ay) * dy) / seg**2, 0, 1)
+    dist2 = (ax + u * dx - px) ** 2 + (ay + u * dy - py) ** 2
+    k = np.argmin(dist2, axis=1)
+    rows = np.arange(len(k))
+    s = cum[k] + u[rows, k] * seg[k]
+    return (s - offset_m) % length, length
+
+
+@dataclass
+class CornerPass:
+    corner: str
+    lap: int
+    t_in: float
+    time: float
+    v_in: float
+    v_min: float
+    v_min_at: float  # metres after the corner start
+    v_out: float
+    lean_max: float
+    brake_at: float | None  # metres before the corner start where braking began
+    brake_g: float
+
+
+def corner_passes(t, s, speed, lean, a_lon, corners, sf_times, track_length: float) -> list[CornerPass]:
+    out = []
+    ds = np.diff(s)
+    fwd = (ds > 0) & (ds < 60)  # moving forward, not wrapping at the line
+    for ci, c in enumerate(corners):
+        a, b = c["start_m"], c["end_m"]
+        # Braking can only start after the previous corner (straight before this one).
+        prev_end = corners[ci - 1]["end_m"]
+        window = min(250.0, (a - prev_end) % track_length)
+        starts = np.where(fwd & (s[:-1] < a) & (s[1:] >= a))[0]
+        for i in starts:
+            ends = np.where(fwd[i:] & (s[i:-1] < b) & (s[i + 1:] >= b))[0]
+            if not len(ends):
+                continue
+            j = i + ends[0]
+            if t[j] - t[i] > 60:
+                continue
+            t_in = t[i] + (a - s[i]) / (s[i + 1] - s[i]) * (t[i + 1] - t[i])
+            t_out = t[j] + (b - s[j]) / (s[j + 1] - s[j]) * (t[j + 1] - t[j])
+            sl = slice(i + 1, j + 1)
+            k = i + 1 + int(np.argmin(speed[sl]))
+            # Braking point: the speed peak before the slowest point, searched
+            # back to 250 m before the corner start.
+            brake_at, brake_g = None, 0.0
+            m0 = i
+            while m0 > 0 and 0 <= a - s[m0 - 1] < window and t[i] - t[m0 - 1] < 20:
+                m0 -= 1
+            m = m0 + int(np.argmax(speed[m0 : k + 1]))
+            if speed[m] - speed[k] > 10:  # a real slow-down, not a lift
+                brake_at = a - s[m]
+                brake_g = float(-np.nanmin(a_lon[m : k + 1])) if np.isfinite(a_lon[m : k + 1]).any() else 0.0
+            lap = int(np.searchsorted(sf_times, t_in))
+            seg_lean = lean[sl]
+            out.append(CornerPass(
+                c["name"], lap, t_in, t_out - t_in, float(np.interp(t_in, t, speed)), float(speed[k]),
+                float(s[k] - a), float(np.interp(t_out, t, speed)),
+                float(np.nanmax(np.abs(seg_lean))) if np.isfinite(seg_lean).any() else float("nan"),
+                brake_at, brake_g))
+    return sorted(out, key=lambda p: p.t_in)
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -306,7 +392,8 @@ def write_gpx(path: Path, fixes: list[Fix]) -> None:
         f.write("</trkseg></trk></gpx>\n")
 
 
-def plot_track(path: Path, x, y, speed, best: Lap | None, gates: list[Gate], outline, title: str) -> None:
+def plot_track(path: Path, x, y, speed, best: Lap | None, gates: list[Gate], outline, title: str,
+               corner_labels=()) -> None:
     fig, ax = plt.subplots(figsize=(10, 10))
     if outline is not None:
         ox, oy = outline
@@ -320,6 +407,9 @@ def plot_track(path: Path, x, y, speed, best: Lap | None, gates: list[Gate], out
         (x1, y1), (x2, y2) = g.ends
         ax.plot([x1, x2], [y1, y2], color="k", lw=2, zorder=3)
         ax.annotate(g.name, (x2, y2), fontsize=9, fontweight="bold", zorder=3)
+    for name, (lx, ly) in corner_labels:
+        ax.annotate(name, (lx, ly), fontsize=10, color="0.25", ha="center", va="center", zorder=4,
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="0.6", alpha=0.85))
     if best:
         title += f" — meilleur tour T{best.number} {fmt_lap(best.time)}"
     ax.set_title(title)
@@ -375,7 +465,8 @@ def plot_lean(path: Path, x, y, lean, best: Lap | None, outline, title: str) -> 
         ox, oy = outline
         ax.plot(np.append(ox, ox[0]), np.append(oy, oy[0]), color="0.6", lw=10, alpha=0.25, zorder=0)
     sel = slice(best.i_start, best.i_end + 1) if best else slice(None)
-    lim = max(10.0, float(np.nanpercentile(np.abs(lean[sel]), 99)))
+    finite = np.isfinite(lean[sel])
+    lim = max(10.0, float(np.percentile(np.abs(lean[sel][finite]), 99))) if finite.any() else 10.0
     sc = ax.scatter(x[sel], y[sel], c=lean[sel], cmap="RdBu_r", vmin=-lim, vmax=lim, s=6, zorder=2)
     fig.colorbar(sc, ax=ax, shrink=0.7, label="angle estimé (°)  ← gauche | droite →")
     ax.set_title(title + (f" — angle, tour T{best.number}" if best else " — angle"))
@@ -416,6 +507,12 @@ def main() -> int:
     args = ap.parse_args()
 
     fixes = parse_nmea(args.log)
+    # Receiver config written by the firmware at boot ($PMMK sentences).
+    with open(args.log, "r", encoding="ascii", errors="replace") as f:
+        for line in f:
+            if line.startswith("$PMMK,GNSS,") and nmea_checksum_ok(line.strip()):
+                print(f"[gps] {line.strip()[11:].split('*')[0]}")
+                break
     if len(fixes) < 10:
         print(f"Only {len(fixes)} valid fixes in {args.log} - nothing to analyse.", file=sys.stderr)
         return 1
@@ -427,10 +524,32 @@ def main() -> int:
     proj = Projection(lat.mean(), lon.mean())
     x, y = proj(lat, lon)
     lean, a_lat, a_lon = dynamics(t, speed, np.array([f.course for f in fixes]))
+    # Poor signal (few satellites, high HDOP, data gap) gives position/course
+    # jumps and absurd lean/g values: blank the dynamics around those fixes.
+    sats = np.array([f.sats for f in fixes])
+    hdop = np.array([f.hdop for f in fixes])
+    bad = (sats < 5) | (hdop > 2.0)
+    bad[1:] |= np.diff(t) > 0.3
+    bad = np.convolve(bad, np.ones(11), mode="same") > 0  # +-0.5 s
+    lean[bad] = np.nan
+    a_lat[bad] = np.nan
+    a_lon[bad] = np.nan
+    if bad.any():
+        print(f"[dyn] {bad.sum() / 10:.1f} s of poor signal excluded from lean/g")
+    # Beyond what track-day tyres allow: GPS course lag/catch-up in tight hairpins.
+    implausible = np.abs(lean) > 62
+    if implausible.any():
+        print(f"[dyn] {implausible.sum() / 10:.1f} s of implausible lean (>62 deg) excluded")
+        lean[implausible] = np.nan
+        a_lat[implausible] = np.nan
 
     dts = np.diff(t)
+    period = np.median(dts)
+    skipped = int(np.round(dts[dts > 1.5 * period] / period).sum() - (dts > 1.5 * period).sum())
+    expected = len(fixes) + skipped
     print(f"[session] {len(fixes)} fixes, {fmt_lap(t[-1] - t[0])} long, "
-          f"rate ~{1 / np.median(dts):.1f} Hz, gaps >1s: {int((dts > 1).sum())}, vmax {speed.max():.1f} km/h")
+          f"rate ~{1 / period:.1f} Hz, skipped epochs: {skipped} ({100 * skipped / expected:.1f}%), "
+          f"gaps >1s: {int((dts > 1).sum())}, vmax {speed.max():.1f} km/h")
 
     out_dir = args.out / args.log.stem
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -440,7 +559,7 @@ def main() -> int:
     gates: list[Gate] = []  # gates[0] = start/finish, then sector gates
     outline = None
     title = "Session complète"
-    track_name = None if args.gate else (args.track or detect_track(lat, lon))
+    track_name = None if (args.gate or args.no_laps) else (args.track or detect_track(lat, lon))
     if track_name == "none":
         track_name = None
     if track_name:
@@ -457,6 +576,8 @@ def main() -> int:
         glat, glon = (float(v) for v in args.gate.split(","))
         gx, gy = proj(glat, glon)
         gates.append(gate_from_trace("S/F", x, y, float(gx), float(gy), args.gate_width))
+    elif args.no_laps:
+        pass
     elif speed.max() < 15:
         print("[laps] vmax < 15 km/h: static/walking session, skipping auto lap detection (use --gate)")
     else:
@@ -487,8 +608,56 @@ def main() -> int:
                     lap.sectors = list(np.diff(marks))
             laps.append(lap)
 
+    if gates and len(gates) > 1:
+        # Every sector timed between two consecutive gates, including those of
+        # laps that are not complete (out-lap, session cut short).
+        events = sorted([(c, 0) for c in crossings] +
+                        [(c, k + 1) for k, sc in enumerate(sector_cross) for c in sc])
+        n_g = len(gates)
+        partial: dict[int, list] = {}
+        lap_no = 0
+        for (ta, ga), (tb, gb) in zip(events, events[1:]):
+            if ga == 0:
+                lap_no += 1
+            if gb == (ga + 1) % n_g and tb - ta < 300:
+                partial.setdefault(lap_no, [None] * n_g)[ga] = tb - ta
+        complete = {l.number for l in laps}
+        rows = {k: v for k, v in partial.items() if k not in complete}
+        if rows:
+            print("  tours incomplets (temps par secteur) :")
+            for k, secs in sorted(rows.items()):
+                name = "sortie" if k == 0 else f"T{k}"
+                txt = "  ".join("   --   " if v is None else f"{v:7.3f} " for v in secs)
+                print(f"  {name:<6}            {txt}")
+
     best = min(laps, key=lambda l: l.time) if laps else None
-    plot_track(out_dir / "track.png", x, y, speed, best, gates, outline, title)
+    corner_labels, passes = [], []
+    if track_name and track.get("corners"):
+        ox, oy = outline
+        for c in track["corners"]:
+            g = gate_on_centerline(c["name"], ox, oy, track["finish_m"] + (c["start_m"] + c["end_m"]) / 2, 0)
+            # label pushed 35 m to the outside of the turn
+            side = -1 if c["dir"].startswith("G") else 1
+            corner_labels.append((c["name"], (g.x + side * g.hy * 35, g.y - side * g.hx * 35)))
+        prog, track_len = track_progress(x, y, ox, oy, track["finish_m"])
+        sf_times = np.array(crossings) if gates else np.array([])
+        passes = corner_passes(t, prog, speed, lean, a_lon, track["corners"], sf_times, track_len)
+        if passes:
+            print("  virages :  tour  freine à   v entrée   v mini (à)    v sortie  angle   temps")
+            for p_ in passes:
+                lap_txt = "sortie" if p_.lap == 0 else f"T{p_.lap}"
+                brake = f"{p_.brake_at:5.0f} m" if p_.brake_at is not None else "   --  "
+                print(f"  {p_.corner:<8} {lap_txt:>6}  {brake}  {p_.v_in:6.1f}    {p_.v_min:6.1f} ({p_.v_min_at:3.0f} m)"
+                      f"  {p_.v_out:6.1f}   {p_.lean_max:4.1f}°  {p_.time:6.2f}s")
+            with open(out_dir / "corners.csv", "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["corner", "lap", "brake_before_m", "brake_g", "v_in_kmh", "v_min_kmh", "v_min_after_m",
+                            "v_out_kmh", "lean_max_deg", "time_s"])
+                for p_ in passes:
+                    w.writerow([p_.corner, p_.lap, "" if p_.brake_at is None else f"{p_.brake_at:.0f}",
+                                f"{p_.brake_g:.2f}", f"{p_.v_in:.1f}", f"{p_.v_min:.1f}", f"{p_.v_min_at:.0f}",
+                                f"{p_.v_out:.1f}", f"{p_.lean_max:.1f}", f"{p_.time:.3f}"])
+    plot_track(out_dir / "track.png", x, y, speed, best, gates, outline, title, corner_labels)
     plot_lean(out_dir / "lean.png", x, y, lean, best, outline, title)
     write_session_csv(out_dir / "session.csv", fixes, laps, lean, a_lat, a_lon)
 

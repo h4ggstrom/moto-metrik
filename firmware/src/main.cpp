@@ -1,6 +1,7 @@
-// moto-metrik: GPS logger.
-// Raw NMEA from the GPS is written verbatim to the SD card (one file per boot).
-// All analysis (laps, traces) happens offline with tools/analyze.py.
+// moto-metrik: GPS + IMU logger.
+// Valid NMEA sentences from the GPS and raw IMU samples ($PIMU) are written to
+// the SD card (one file per boot). All analysis happens offline with
+// tools/analyze.py.
 
 #include <Arduino.h>
 #include <SD.h>
@@ -10,6 +11,7 @@
 #include <time.h>
 
 #include "config.h"
+#include "imu.h"
 
 static HardwareSerial &gpsSerial = Serial2;
 static SPIClass sdSpi(VSPI);
@@ -21,6 +23,7 @@ static bool sdOk = false;
 static bool clockSet = false;
 static uint32_t lastFlush = 0;
 static uint32_t bytesLogged = 0;
+static bool imuOk = false;
 
 // ---------------------------------------------------------------------------
 // u-blox configuration (UBX binary protocol)
@@ -63,14 +66,78 @@ static int ubxWaitAck(uint8_t cls, uint8_t id, uint32_t timeoutMs = 500) {
 
 static const char *ackStr(int r) { return r == 1 ? "ACK" : r == 0 ? "NAK" : "no reply"; }
 
-static void ubxDisableNmea(uint8_t msgId) {
-  const uint8_t p[] = {0xF0, msgId, 0};
+// Output rate of an NMEA message on this port, in navigation epochs (0 = off).
+static void ubxSetNmeaRate(uint8_t msgId, uint8_t rate) {
+  const uint8_t p[] = {0xF0, msgId, rate};
   ubxSend(0x06, 0x01, p, sizeof(p));  // CFG-MSG
+}
+
+// Poll a UBX message (empty payload) and copy the answer's payload.
+// Returns the payload length, or -1 on timeout.
+static int ubxPoll(uint8_t cls, uint8_t id, uint8_t *out, uint16_t maxLen, uint32_t timeoutMs = 1000) {
+  while (gpsSerial.available()) gpsSerial.read();
+  ubxSend(cls, id, nullptr, 0);
+  const uint8_t hdr[] = {0xB5, 0x62, cls, id};
+  uint8_t n = 0;
+  uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    if (!gpsSerial.available()) { delay(1); continue; }
+    uint8_t b = gpsSerial.read();
+    if (n < 4) {
+      n = (b == hdr[n]) ? n + 1 : (b == 0xB5);
+      continue;
+    }
+    // header matched: length, payload, checksum
+    while (gpsSerial.available() < 1 && millis() - start < timeoutMs) delay(1);
+    uint16_t len = b | (gpsSerial.read() << 8);
+    for (uint16_t i = 0; i < len + 2; i++) {
+      while (!gpsSerial.available()) {
+        if (millis() - start >= timeoutMs) return -1;
+        delay(1);
+      }
+      uint8_t c = gpsSerial.read();
+      if (i < len && i < maxLen) out[i] = c;
+    }
+    return len < maxLen ? len : maxLen;
+  }
+  return -1;
 }
 
 static void ubxSetRate(uint16_t ms) {
   const uint8_t p[] = {(uint8_t)(ms & 0xFF), (uint8_t)(ms >> 8), 1, 0, 1, 0};
   ubxSend(0x06, 0x08, p, sizeof(p));  // CFG-RATE
+}
+
+// SBAS (EGNOS) on/off. With corrections applied, the NEO-M8N drops from 10 Hz
+// to ~5 Hz (every other epoch skipped, measured on 2026-10-15): keep it off.
+static void ubxSetSbas(bool enabled) {
+  uint8_t p[8] = {0};
+  p[0] = enabled ? 0x01 : 0x00;  // mode
+  p[1] = 0x07;                   // usage: range + diffCorr + integrity (when enabled)
+  p[2] = 3;                      // maxSBAS
+  ubxSend(0x06, 0x16, p, sizeof(p));  // CFG-SBAS
+}
+
+// Constellations: GPS + one of Galileo / GLONASS. The NEO-M8N holds 10 Hz with
+// two concurrent GNSS, not three. QZSS follows GPS (u-blox recommendation).
+// The receiver restarts its GNSS engine after this message.
+static void ubxSetGnss(bool galileo) {
+  // gnssId, resTrkCh, maxTrkCh, reserved, flags (enable bit0, sigCfgMask = L1/E1)
+  const uint8_t blocks[][8] = {
+      {0, 8, 16, 0, 0x01, 0x00, 0x01, 0x01},                      // GPS
+      {1, 1, 3, 0, 0x00, 0x00, 0x01, 0x01},                       // SBAS (off)
+      {2, 4, 8, 0, (uint8_t)(galileo ? 1 : 0), 0x00, 0x01, 0x01},  // Galileo
+      {3, 8, 16, 0, 0x00, 0x00, 0x01, 0x01},                      // BeiDou (off)
+      {5, 0, 3, 0, 0x01, 0x00, 0x01, 0x01},                       // QZSS
+      {6, 8, 14, 0, (uint8_t)(galileo ? 0 : 1), 0x00, 0x01, 0x01},  // GLONASS
+  };
+  uint8_t p[4 + sizeof(blocks)];
+  p[0] = 0;     // msgVer
+  p[1] = 0;     // numTrkChHw (read-only)
+  p[2] = 0xFF;  // numTrkChUse: all available
+  p[3] = sizeof(blocks) / 8;
+  memcpy(p + 4, blocks, sizeof(blocks));
+  ubxSend(0x06, 0x3E, p, sizeof(p));  // CFG-GNSS
 }
 
 // Navigation filter dynamics: the default "portable" model over-smooths
@@ -120,6 +187,77 @@ static uint32_t gpsProbeBaud() {
   return 0;
 }
 
+// Every write to the log goes through here. A short write means the card
+// stopped answering (loose wire, card pulled): flag it, sdRecover() takes over.
+static uint32_t sdFailures = 0;
+static void logWrite(const uint8_t *buf, size_t len) {
+  if (!sdOk) return;
+  if (logFile.write(buf, len) != len) {
+    sdOk = false;
+    sdFailures++;
+    Serial.println("[sd] write failed - card lost");
+    return;
+  }
+  bytesLogged += len;
+}
+
+// Append "*CS\r\n" to a "$..." sentence in buf (len chars) and write it to the log.
+static void logSentence(char *buf, int len, size_t cap) {
+  uint8_t cs = 0;
+  for (int i = 1; i < len; i++) cs ^= (uint8_t)buf[i];
+  len += snprintf(buf + len, cap - len, "*%02X\r\n", cs);
+  logWrite((const uint8_t *)buf, len);
+}
+
+// Session metadata ($PMMK lines) is kept so it can be replayed at the top of
+// a new file after an SD recovery: the IMU scale factors must be in every file.
+static char infoLines[6][200];
+static int nInfo = 0;
+
+// Write a "$PMMK,<text>*CS" sentence to the log (and the console): session
+// metadata that NMEA parsers skip.
+static void logInfo(const char *text) {
+  char line[200];
+  int n = snprintf(line, sizeof(line), "$PMMK,%s", text);
+  uint8_t cs = 0;
+  for (int i = 1; i < n; i++) cs ^= (uint8_t)line[i];
+  snprintf(line + n, sizeof(line) - n, "*%02X\r\n", cs);
+  Serial.printf("[info] %s", line);
+  logWrite((const uint8_t *)line, strlen(line));
+  if (nInfo < 6) strlcpy(infoLines[nInfo++], line, sizeof(infoLines[0]));
+}
+
+static void gpsReportVersion() {
+  uint8_t buf[160];
+  int len = ubxPoll(0x0A, 0x04, buf, sizeof(buf));  // MON-VER
+  if (len >= 40) {
+    char text[190];
+    int n = snprintf(text, sizeof(text), "MONVER,%.30s,%.10s", (char *)buf, (char *)buf + 30);
+    for (int off = 40; off + 30 <= len && n < (int)sizeof(text) - 32; off += 30)
+      n += snprintf(text + n, sizeof(text) - n, ",%.30s", (char *)buf + off);
+    for (char *c = text; *c; c++)
+      if (*c == '*' || *c == '$') *c = '_';
+    logInfo(text);
+  } else {
+    Serial.println("[gps] MON-VER: no reply");
+  }
+
+  len = ubxPoll(0x06, 0x3E, buf, sizeof(buf));  // CFG-GNSS
+  if (len >= 4) {
+    static const char *names[] = {"GPS", "SBAS", "GAL", "BDS", "IMES", "QZSS", "GLO"};
+    char text[160];
+    int n = snprintf(text, sizeof(text), "GNSS,sbas_corr=%s,ch=%u/%u", GPS_SBAS ? "on" : "off", buf[1], buf[2]);
+    for (int b = 0; b < buf[3] && 4 + 8 * b + 8 <= len; b++) {
+      const uint8_t *blk = buf + 4 + 8 * b;
+      const char *name = blk[0] < 7 ? names[blk[0]] : "?";
+      n += snprintf(text + n, sizeof(text) - n, ",%s:%s", name, (blk[4] & 0x01) ? "on" : "off");
+    }
+    logInfo(text);
+  } else {
+    Serial.println("[gps] CFG-GNSS: no reply");
+  }
+}
+
 // Find the GPS baud rate and push our settings. Also used to recover a GPS
 // that lost power mid-session: it then reboots on factory settings (9600 baud, 1 Hz).
 static bool gpsConfigure() {
@@ -131,11 +269,13 @@ static bool gpsConfigure() {
   }
   Serial.printf("[gps] found NMEA at %u baud\n", baud);
 
-  // Keep only RMC (position/speed/course/date) and GGA (fix/sats/hdop/alt).
-  ubxDisableNmea(0x01);  // GLL
-  ubxDisableNmea(0x02);  // GSA
-  ubxDisableNmea(0x03);  // GSV
-  ubxDisableNmea(0x05);  // VTG
+  // RMC (position/speed/course/date) and GGA (fix/sats/hdop/alt) every epoch;
+  // GSA (satellites used) and GSV (satellites in view) at a low rate to see
+  // the receiver load; GLL and VTG off.
+  ubxSetNmeaRate(0x01, 0);  // GLL
+  ubxSetNmeaRate(0x02, GPS_SAT_INFO_EPOCHS);  // GSA
+  ubxSetNmeaRate(0x03, GPS_SAT_INFO_EPOCHS);  // GSV
+  ubxSetNmeaRate(0x05, 0);  // VTG
 
   if (baud != GPS_TARGET_BAUD) {
     ubxSetBaud(GPS_TARGET_BAUD);
@@ -154,6 +294,11 @@ static bool gpsConfigure() {
   Serial.printf("[gps] rate %u ms: %s\n", GPS_RATE_MS, ackStr(ubxWaitAck(0x06, 0x08)));
   ubxSetDynamicModel(GPS_DYN_MODEL);
   Serial.printf("[gps] dynamic model %u: %s\n", GPS_DYN_MODEL, ackStr(ubxWaitAck(0x06, 0x24)));
+  ubxSetSbas(GPS_SBAS);
+  Serial.printf("[gps] SBAS %s: %s\n", GPS_SBAS ? "on" : "off", ackStr(ubxWaitAck(0x06, 0x16)));
+  ubxSetGnss(GPS_GALILEO);
+  Serial.printf("[gps] GNSS GPS+%s: %s\n", GPS_GALILEO ? "Galileo" : "GLONASS", ackStr(ubxWaitAck(0x06, 0x3E)));
+  gpsReportVersion();
   return true;
 }
 
@@ -167,37 +312,98 @@ static void gpsInit() {
 // SD logging
 // ---------------------------------------------------------------------------
 
-static void sdInit() {
-  sdSpi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+static bool sdMount(int attempts) {
   // After a soft reset (flash, brownout) the card keeps power and can be stuck
   // mid-transaction: retry, it usually answers on the second attempt.
-  bool mounted = false;
-  for (int attempt = 1; attempt <= 5 && !mounted; attempt++) {
-    mounted = SD.begin(SD_CS_PIN, sdSpi, SD_SPI_FREQ);
-    if (!mounted) {
-      Serial.printf("[sd] mount attempt %d failed\n", attempt);
-      SD.end();
-      delay(200);
-    }
+  for (int attempt = 1; attempt <= attempts; attempt++) {
+    if (SD.begin(SD_CS_PIN, sdSpi, SD_SPI_FREQ)) return true;
+    Serial.printf("[sd] mount attempt %d failed\n", attempt);
+    SD.end();
+    delay(200);
   }
-  if (!mounted) {
-    Serial.println("[sd] mount failed");
-    return;
-  }
-  Serial.printf("[sd] card %llu MB\n", SD.cardSize() / (1024 * 1024));
+  return false;
+}
 
-  // Temporary name until the GPS gives the date (see syncClockAndRename).
-  for (int i = 1; i < 10000; i++) {
-    snprintf(logPath, sizeof(logPath), "/log_%04d.nmea", i);
-    if (!SD.exists(logPath)) break;
+// Open a new log file: named after the current local time once the clock is
+// set, /log_NNNN.nmea before that (renamed at the first fix).
+static bool sdOpenNew() {
+  if (clockSet) {
+    time_t now = time(nullptr);
+    struct tm local;
+    localtime_r(&now, &local);
+    strftime(logPath, sizeof(logPath), "/%Y-%m-%d_%H-%M-%S.nmea", &local);
+  } else {
+    for (int i = 1; i < 10000; i++) {
+      snprintf(logPath, sizeof(logPath), "/log_%04d.nmea", i);
+      if (!SD.exists(logPath)) break;
+    }
   }
   logFile = SD.open(logPath, FILE_WRITE);
   if (!logFile) {
     Serial.printf("[sd] cannot open %s\n", logPath);
-    return;
+    return false;
   }
   sdOk = true;
   Serial.printf("[sd] logging to %s\n", logPath);
+  return true;
+}
+
+static void sdInit() {
+  sdSpi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  if (!sdMount(5)) {
+    Serial.println("[sd] mount failed");
+    return;
+  }
+  Serial.printf("[sd] card %llu MB\n", SD.cardSize() / (1024 * 1024));
+  sdOpenNew();
+}
+
+// Card lost (or never mounted): retry every SD_RECOVER_MS. On success, logging
+// resumes in a new file that starts with the session metadata.
+static void sdRecover() {
+  static uint32_t lastAttempt = 0;
+  if (sdOk || millis() - lastAttempt < SD_RECOVER_MS) return;
+  lastAttempt = millis();
+  logFile.close();
+  SD.end();
+  if (!sdMount(1)) return;
+  if (!sdOpenNew()) return;
+  char t[60];
+  logSentence(t, snprintf(t, sizeof(t), "$PMMK,RESUMED,failures=%u", sdFailures), sizeof(t));
+  for (int i = 0; i < nInfo; i++) logWrite((const uint8_t *)infoLines[i], strlen(infoLines[i]));
+  Serial.println("[sd] recovered");
+}
+
+// BOOT button (GPIO0, usable once booted): a short press closes the current
+// log and starts a new one, to split sessions without unplugging.
+static uint32_t ledAckUntil = 0;  // LED acknowledgement blink window
+
+static void newSession() {
+  if (sdOk) {
+    char t[40];
+    logSentence(t, snprintf(t, sizeof(t), "$PMMK,SESSION_END"), sizeof(t));
+    logFile.close();
+  }
+  sdOk = false;
+  if (!sdOpenNew()) return;  // sdRecover() retries if the card is gone
+  char t[40];
+  logSentence(t, snprintf(t, sizeof(t), "$PMMK,SESSION_START,button"), sizeof(t));
+  for (int i = 0; i < nInfo; i++) logWrite((const uint8_t *)infoLines[i], strlen(infoLines[i]));
+  ledAckUntil = millis() + 1500;
+  Serial.println("[session] new log started by button");
+}
+
+static void pollButton() {
+  static bool wasDown = false;
+  static uint32_t downSince = 0, lastPress = 0;
+  bool down = digitalRead(SESSION_BUTTON_PIN) == LOW;
+  if (down && !wasDown) downSince = millis();
+  // Act on release after >= 50 ms (debounce), at most once every 3 s.
+  if (!down && wasDown && millis() - downSince >= 50 && millis() - lastPress > 3000) {
+    lastPress = millis();
+    newSession();
+  }
+  wasDown = down;
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +414,8 @@ static void sdInit() {
 static char nmeaLine[128];
 static size_t nmeaLen = 0;
 static uint32_t lastValidSentence = 0;  // millis() of the last valid sentence
+static uint32_t rmcCount = 0;           // one RMC per navigation epoch
+static uint32_t nmeaStartMs = 0;        // millis() when the current sentence's '$' was read
 
 static int hexVal(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -228,6 +436,7 @@ static bool nmeaChecksumOk(const char *line, size_t len) {
 
 static void nmeaFeed(char c) {
   if (c == '$') {  // start of sentence: drop any unfinished one
+    nmeaStartMs = millis();
     nmeaLen = 0;
     nmeaLine[nmeaLen++] = c;
     return;
@@ -237,16 +446,20 @@ static void nmeaFeed(char c) {
   if (c == '\n') {
     if (nmeaChecksumOk(nmeaLine, nmeaLen)) {
       lastValidSentence = millis();
-      if (sdOk) {
-        logFile.write((const uint8_t *)nmeaLine, nmeaLen);
-        logFile.write((const uint8_t *)"\r\n", 2);
-        bytesLogged += nmeaLen + 2;
+      if (nmeaLen > 6 && memcmp(nmeaLine + 3, "RMC", 3) == 0) {
+        rmcCount++;
+        // Reception time of this epoch, to align IMU samples with GPS time.
+        char t[40];
+        logSentence(t, snprintf(t, sizeof(t), "$PTRX,%u", nmeaStartMs), sizeof(t));
       }
+      nmeaLine[nmeaLen] = '\r';  // room left: nmeaLen < sizeof(nmeaLine) - 1
+      nmeaLine[nmeaLen + 1] = '\n';
+      logWrite((const uint8_t *)nmeaLine, nmeaLen + 2);
     }
     nmeaLen = 0;
     return;
   }
-  if (c < 0x20 || c > 0x7E || nmeaLen >= sizeof(nmeaLine)) {
+  if (c < 0x20 || c > 0x7E || nmeaLen >= sizeof(nmeaLine) - 2) {
     nmeaLen = 0;  // not text: noise
     return;
   }
@@ -340,7 +553,8 @@ static void updateLed() {
   uint32_t now = millis();
   uint32_t phase = now % 1000;
   bool on;
-  if (!sdOk) on = (now / 100) % 2;
+  if (now < ledAckUntil) on = (now / 60) % 2;  // new session acknowledged: flicker
+  else if (!sdOk) on = (now / 100) % 2;
   else if (gpsSilent()) on = phase < 100 || (phase >= 200 && phase < 300);
   else if (!gps.location.isValid() || gps.location.age() > 2000) on = (now / 500) % 2;
   else on = true;
@@ -349,28 +563,37 @@ static void updateLed() {
 
 static void printStatus() {
   static uint32_t last = 0;
-  static uint32_t lastSentences = 0;
+  static uint32_t lastRmc = 0;
   if (millis() - last < 1000) return;
   last = millis();
-  // RMC + GGA per epoch -> sentences/2 = update rate
-  uint32_t sentences = gps.passedChecksum();
-  float hz = (sentences - lastSentences) / 2.0f;
-  lastSentences = sentences;
-  Serial.printf("[status] fix=%d hz=%.0f sats=%u hdop=%.1f lat=%.6f lon=%.6f speed=%.1fkm/h logged=%uB chk_fail=%u\n",
+  float hz = rmcCount - lastRmc;  // RMC per second = navigation rate
+  lastRmc = rmcCount;
+  static uint32_t lastImu = 0;
+  uint32_t imuHz = imuSamples() - lastImu;
+  lastImu = imuSamples();
+  Serial.printf("[status] fix=%d hz=%.0f sats=%u hdop=%.1f speed=%.1fkm/h imu=%s/%uHz err=%u drop=%u logged=%uB\n",
                 gps.location.isValid() && gps.location.age() < 2000, hz, gps.satellites.value(),
-                gps.hdop.hdop(), gps.location.lat(), gps.location.lng(), gps.speed.kmph(),
-                bytesLogged, gps.failedChecksum());
+                gps.hdop.hdop(), gps.speed.kmph(), imuOk ? "ok" : "off", imuHz, imuErrors(), imuDropped(),
+                bytesLogged);
 }
 
 void setup() {
   Serial.begin(115200);
   pinMode(LED_PIN, OUTPUT);
+  pinMode(SESSION_BUTTON_PIN, INPUT_PULLUP);
   delay(200);
   Serial.println("\n=== moto-metrik ===");
   setenv("TZ", LOG_TZ, 1);
   tzset();
   sdInit();
   gpsInit();
+#if IMU_ENABLED
+  imuOk = imuBegin();
+  char info[120];
+  snprintf(info, sizeof(info), "IMU,%s,rate_hz=%d,accel_lsb_per_g=%d,gyro_lsb_per_dps=%.1f", imuOk ? "ICM20948" : "none",
+           IMU_RATE_HZ, IMU_ACCEL_LSB_PER_G, IMU_GYRO_LSB_PER_DPS);
+  logInfo(info);
+#endif
   lastValidSentence = millis();  // grace period before the watchdog kicks in
 }
 
@@ -381,10 +604,19 @@ void loop() {
     nmeaFeed(c);
   }
 
+  ImuSample m;
+  while (imuPop(m)) {
+    char t[80];
+    int n = snprintf(t, sizeof(t), "$PIMU,%u,%d,%d,%d,%d,%d,%d,%d", m.ms, m.ax, m.ay, m.az, m.gx, m.gy, m.gz, m.temp);
+    logSentence(t, n, sizeof(t));
+  }
+
   if (sdOk && millis() - lastFlush >= LOG_FLUSH_MS) {
     logFile.flush();
     lastFlush = millis();
   }
+  sdRecover();
+  pollButton();
 
   gpsWatchdog();
   syncClockAndRename();

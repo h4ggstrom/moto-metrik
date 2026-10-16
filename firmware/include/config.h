@@ -59,5 +59,14 @@
 // ---------------------------------------------------------------------------
 #define LED_PIN 2
 
-// Session button: the devkit's BOOT button. Short press = start a new log file.
+// Sessions and paddock Wi-Fi. With WEB_ENABLED the box idles in the paddock
+// (Wi-Fi up, nothing logged), a session starts when the bike rolls faster than
+// SESSION_START_KMH for 2 s and ends after SESSION_STOP_S stopped.
+#define WEB_ENABLED 1
+#define WEB_SSID "moto-metrik"
+#define WEB_PASSWORD "carole93"  // WPA2, >= 8 chars
+#define SESSION_START_KMH 10
+#define SESSION_STOP_S 60
+
+// Session button: the devkit's BOOT button. Short press = start / end a session.
 #define SESSION_BUTTON_PIN 0

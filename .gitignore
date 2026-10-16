@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 data/
 out/
+firmware/include/web_page.h
+tools/web/build/

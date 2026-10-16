@@ -26,6 +26,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
+from imu import imu_dynamics, load_imu  # noqa: E402
+
 EARTH_R = 6371000.0
 KNOT_KMH = 1.852
 
@@ -536,6 +538,24 @@ def main() -> int:
     a_lon[bad] = np.nan
     if bad.any():
         print(f"[dyn] {bad.sum() / 10:.1f} s of poor signal excluded from lean/g")
+    # IMU, when logged and rigidly mounted: replaces the GPS-derived dynamics.
+    lean_gps = lean.copy()
+    imu = load_imu(args.log)
+    if imu is not None:
+        course = np.array([f.course for f in fixes], dtype=float)
+        ok_c = np.isfinite(course)
+        yaw_gps = (np.degrees(np.gradient(np.unwrap(np.radians(np.interp(t, t[ok_c], course[ok_c]))), t))
+                   if ok_c.sum() > 2 else np.zeros_like(t))
+        dyn = imu_dynamics(imu, t, speed, a_lon, yaw_gps)
+        if dyn is None:
+            print("[imu] not enough stops/straights/braking to calibrate the mounting: GPS dynamics kept")
+        else:
+            print(f"[imu] {dyn.info}")
+            both = np.isfinite(lean_gps) & (speed > 30)
+            if both.any():
+                print(f"[imu] lean IMU vs GPS: median |diff| {np.median(np.abs(dyn.lean[both] - lean_gps[both])):.1f} deg")
+            lean, a_lat, a_lon = dyn.lean, dyn.a_lat, dyn.a_lon
+            lean[speed < 15] = np.nan
     # Beyond what track-day tyres allow: GPS course lag/catch-up in tight hairpins.
     implausible = np.abs(lean) > 62
     if implausible.any():

@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>moto-metrik</title>
+<style>
+:root {
+  --bg: #f4f5f7; --card: #fff; --fg: #15171a; --muted: #636a74; --line: #dfe2e6;
+  --accent: #0b63ce; --best: #7a2ee0; --ok: #1a8f3c; --bad: #c62828;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1114; --card: #1a1d22; --fg: #eef0f3; --muted: #9aa2ad; --line: #2c3139;
+    --accent: #5aa2ff; --best: #b98cff; --ok: #4cc472; --bad: #ff6b6b;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, -apple-system, sans-serif; }
+header { position: sticky; top: 0; z-index: 2; background: var(--card); border-bottom: 1px solid var(--line);
+         padding: 10px 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+header h1 { font-size: 17px; margin: 0; flex: 1; }
+.pill { font-size: 12px; padding: 3px 8px; border-radius: 99px; background: var(--bg); color: var(--muted); white-space: nowrap; }
+.pill.ok { color: var(--ok); } .pill.bad { color: var(--bad); }
+main { padding: 12px 16px 40px; max-width: 900px; margin: 0 auto; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin-bottom: 12px; }
+.card h2 { font-size: 15px; margin: 0 0 8px; }
+button, .btn { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--fg);
+               padding: 8px 12px; border-radius: 8px; cursor: pointer; text-decoration: none; display: inline-block; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.files { list-style: none; margin: 0; padding: 0; }
+.files li { display: flex; justify-content: space-between; gap: 8px; padding: 10px 4px; border-top: 1px solid var(--line); cursor: pointer; }
+.files li:first-child { border-top: 0; }
+.files li.sel { color: var(--accent); font-weight: 600; }
+.muted { color: var(--muted); font-size: 13px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
+.stat { background: var(--bg); border-radius: 8px; padding: 8px 10px; }
+.stat b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+.stat span { font-size: 12px; color: var(--muted); }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 14px; }
+th, td { padding: 6px 8px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { font-size: 12px; color: var(--muted); font-weight: 500; }
+td.best { color: var(--best); font-weight: 700; }
+tr.sel td { background: var(--bg); }
+canvas { width: 100%; display: block; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.chip { font-size: 13px; padding: 4px 10px; border-radius: 99px; border: 1px solid var(--line); cursor: pointer; user-select: none; }
+.chip.on { border-color: currentColor; font-weight: 600; }
+select { font: inherit; padding: 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+</style>
+</head>
+<body>
+<header>
+  <h1>moto-metrik</h1>
+  <span class="pill" id="st-gps">GPS …</span>
+  <span class="pill" id="st-imu">IMU …</span>
+  <span class="pill" id="st-sd">SD …</span>
+</header>
+<main>
+  <div class="card">
+    <div class="row" style="justify-content: space-between">
+      <h2 style="margin:0">Sessions</h2>
+      <div class="row">
+        <button id="btn-new" class="primary">Démarrer une session</button>
+        <label class="btn">Ouvrir un fichier<input type="file" id="file-in" accept=".nmea,.txt" hidden></label>
+      </div>
+    </div>
+    <p class="muted" id="files-msg">Chargement…</p>
+    <ul class="files" id="files"></ul>
+  </div>
+  <div id="report"></div>
+</main>
+
+<script>/*ANALYSIS_JS*/</script>
+<script>
+"use strict";
+const TRACKS = /*TRACKS_JSON*/[];
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const PALETTE = ["#0b63ce", "#e8590c", "#2b8a3e", "#c2255c", "#5f3dc4", "#0c8599", "#e67700", "#495057"];
+
+// ---------------------------------------------------------------- device API
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  return r;
+}
+
+async function refreshStatus() {
+  try {
+    const s = await (await api("/api/status")).json();
+    const g = $("#st-gps");
+    g.textContent = s.fix ? `GPS ${s.sats} sat · ${s.hz} Hz` : `GPS sans fix (${s.sats})`;
+    g.className = "pill " + (s.fix ? "ok" : "bad");
+    $("#st-imu").textContent = s.imu ? "IMU ok" : "IMU off";
+    $("#st-imu").className = "pill " + (s.imu ? "ok" : "bad");
+    $("#st-sd").textContent = s.sd ? `SD ${(s.free_mb / 1024).toFixed(1)} Go libres` : "SD erreur";
+    $("#st-sd").className = "pill " + (s.sd ? "ok" : "bad");
+  } catch (e) {
+    for (const id of ["#st-gps", "#st-imu", "#st-sd"]) $(id).textContent = "hors ligne";
+  }
+}
+
+async function loadFiles() {
+  try {
+    const files = await (await api("/api/files")).json();
+    files.sort((a, b) => b.name.localeCompare(a.name));
+    $("#files-msg").textContent = files.length ? "" : "Aucune session sur la carte.";
+    $("#files").innerHTML = files.map(f =>
+      `<li data-name="${esc(f.name)}"><span>${esc(f.name.replace(".nmea", "").replace("_", " "))}</span>` +
+      `<span class="muted">${(f.size / 1e6).toFixed(1)} Mo</span></li>`).join("");
+    for (const li of document.querySelectorAll("#files li")) li.onclick = () => openRemote(li.dataset.name, li);
+  } catch (e) {
+    $("#files-msg").textContent = "Boîtier injoignable : ouvrez un fichier enregistré.";
+  }
+}
+
+async function openRemote(name, li) {
+  document.querySelectorAll("#files li").forEach(x => x.classList.toggle("sel", x === li));
+  $("#report").innerHTML = `<div class="card muted">Téléchargement de ${esc(name)}…</div>`;
+  try {
+    const text = await (await api("/api/file?name=" + encodeURIComponent(name))).text();
+    show(name, text);
+  } catch (e) {
+    $("#report").innerHTML = `<div class="card">Erreur : ${esc(e.message)}</div>`;
+  }
+}
+
+$("#btn-new").onclick = async () => {
+  if (!confirm("Démarrer l'enregistrement maintenant ? Le Wi-Fi du boîtier va se couper jusqu'à la fin de la session.")) return;
+  try { await api("/api/session/new", { method: "POST" }); $("#files-msg").textContent = "Session démarrée, Wi-Fi coupé."; }
+  catch (e) { alert("Impossible : " + e.message); }
+};
+$("#file-in").onchange = async e => {
+  const f = e.target.files[0];
+  if (f) show(f.name, await f.text());
+};
+
+// ---------------------------------------------------------------- report
+let R = null, shownLaps = new Set(), cornerLap = null;
+
+function show(name, text) {
+  R = analyze(text, TRACKS);
+  if (R.error) { $("#report").innerHTML = `<div class="card">${esc(R.error)}</div>`; return; }
+  shownLaps = new Set();
+  if (R.best) shownLaps.add(R.best.number);
+  if (R.laps.length > 1) shownLaps.add(R.laps[R.laps.length - 1].number);
+  cornerLap = R.best ? R.best.number : (R.corners.length ? R.corners[R.corners.length - 1].lap : null);
+  render(name);
+}
+
+function render(name) {
+  const d = new Date(R.start * 1000);
+  const fixInfo = R.info.GNSS ? R.info.GNSS.replace(/sbas_corr=\w+,ch=[\d/]+,/, "") : "";
+  let h = `<div class="card"><h2>${esc(R.track ? R.track.name : "Session")} — ${d.toLocaleDateString("fr-FR")} ${d.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}</h2>
+    <div class="stats">
+      ${stat(R.best ? fmtLap(R.best.time) : "--", "meilleur tour")}
+      ${stat(R.ideal ? fmtLap(R.ideal) : "--", "tour idéal")}
+      ${stat(R.laps.length, "tours complets")}
+      ${stat(R.vmax.toFixed(0) + " km/h", "vitesse max")}
+      ${stat(maxAbs(R.lean).toFixed(0) + "°", "angle max (GPS)")}
+      ${stat(fmtDur(R.duration), "durée")}
+    </div>
+    <p class="muted">${R.n} points · ${R.rateHz.toFixed(0)} Hz · ${R.skippedPct.toFixed(1)} % sautés${fixInfo ? " · " + esc(fixInfo.replace(/,/g, " ")) : ""}</p></div>`;
+
+  if (R.laps.length || R.partial.length) h += lapsCard();
+  h += `<div class="card"><h2>Tracé</h2><canvas id="map"></canvas></div>`;
+  if (R.laps.length) h += `<div class="card"><h2>Vitesse et angle par tour</h2><div class="chips" id="chips"></div><canvas id="chart"></canvas></div>`;
+  if (R.corners.length) h += cornersCard();
+  $("#report").innerHTML = h;
+  if (R.laps.length) renderChips();
+  drawMap();
+  if (R.laps.length) drawChart();
+  const sel = $("#corner-lap");
+  if (sel) sel.onchange = () => { cornerLap = +sel.value; render(name); };
+}
+
+const stat = (v, l) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`;
+const maxAbs = a => { let m = 0; for (const v of a) if (isFinite(v)) m = Math.max(m, Math.abs(v)); return m; };
+const fmtDur = s => `${Math.floor(s / 60)} min ${String(Math.round(s % 60)).padStart(2, "0")}`;
+
+function lapsCard() {
+  const nSec = R.gates.length > 1 ? R.gates.length : 0;
+  let h = `<div class="card"><h2>Tours</h2><div class="scroll"><table><tr><th>Tour</th><th>Temps</th>`;
+  for (let k = 0; k < nSec; k++) h += `<th>S${k + 1}</th>`;
+  h += `<th>Écart</th><th>V max</th></tr>`;
+  for (const l of R.laps) {
+    h += `<tr class="${shownLaps.has(l.number) ? "sel" : ""}"><td>T${l.number}</td>`;
+    h += `<td class="${l === R.best ? "best" : ""}">${fmtLap(l.time)}</td>`;
+    l.sectors.forEach((s, k) => h += `<td class="${s !== null && s === R.bestSectors[k] ? "best" : ""}">${s === null ? "--" : s.toFixed(3)}</td>`);
+    h += `<td>${l === R.best ? "" : "+" + (l.time - R.best.time).toFixed(3)}</td><td>${l.vmax.toFixed(0)}</td></tr>`;
+  }
+  for (const p of R.partial) {
+    h += `<tr><td class="muted">${p.lap === 0 ? "sortie" : "T" + p.lap + " (incomplet)"}</td><td class="muted">--</td>`;
+    p.sectors.forEach(s => h += `<td class="muted">${s === null ? "--" : s.toFixed(3)}</td>`);
+    h += `<td></td><td></td></tr>`;
+  }
+  h += `</table></div>`;
+  if (R.ideal) h += `<p class="muted">Tour idéal (meilleurs secteurs) : <b>${fmtLap(R.ideal)}</b>, soit −${(R.best.time - R.ideal).toFixed(3)} s sur le meilleur tour.</p>`;
+  return h + `</div>`;
+}
+
+function cornersCard() {
+  const laps = [...new Set(R.corners.map(c => c.lap))];
+  const lapName = l => (l === 0 ? "sortie" : "T" + l);
+  let h = `<div class="card"><div class="row" style="justify-content:space-between"><h2 style="margin:0">Virages</h2>
+    <select id="corner-lap">${laps.map(l => `<option value="${l}" ${l === cornerLap ? "selected" : ""}>${lapName(l)}${R.best && l === R.best.number ? " ★" : ""}</option>`).join("")}</select></div>
+    <div class="scroll"><table><tr><th>Virage</th><th>Freine à</th><th>V entrée</th><th>V mini</th><th>V sortie</th><th>Angle</th><th>Temps</th><th>vs meilleur</th></tr>`;
+  for (const c of R.corners.filter(c => c.lap === cornerLap)) {
+    const others = R.corners.filter(o => o.corner === c.corner);
+    const bestT = Math.min(...others.map(o => o.time));
+    const d = c.time - bestT;
+    h += `<tr><td>${esc(c.corner)}</td><td>${c.brakeAt === null ? "--" : c.brakeAt.toFixed(0) + " m"}</td>
+      <td>${c.vIn.toFixed(0)}</td><td>${c.vMin.toFixed(0)}</td><td>${c.vOut.toFixed(0)}</td>
+      <td>${isFinite(c.leanMax) ? c.leanMax.toFixed(0) + "°" : "--"}</td>
+      <td class="${d < 1e-6 && others.length > 1 ? "best" : ""}">${c.time.toFixed(2)}</td>
+      <td>${others.length > 1 ? (d < 1e-6 ? "★" : "+" + d.toFixed(2)) : ""}</td></tr>`;
+  }
+  return h + `</table></div><p class="muted">Vitesses en km/h. « Freine à » : distance avant l'entrée du virage où la vitesse commence à chuter.</p></div>`;
+}
+
+function renderChips() {
+  $("#chips").innerHTML = R.laps.map((l, i) =>
+    `<span class="chip ${shownLaps.has(l.number) ? "on" : ""}" style="color:${lapColor(l)}" data-n="${l.number}">T${l.number} ${fmtLap(l.time)}${l === R.best ? " ★" : ""}</span>`).join("");
+  for (const c of document.querySelectorAll("#chips .chip")) c.onclick = () => {
+    const n = +c.dataset.n;
+    shownLaps.has(n) ? shownLaps.delete(n) : shownLaps.add(n);
+    renderChips(); drawChart(); drawMap();
+  };
+}
+const lapColor = l => (l === R.best ? css("--best") : PALETTE[(l.number - 1) % PALETTE.length]);
+
+// ---------------------------------------------------------------- drawing
+function setupCanvas(cv, aspect) {
+  const w = cv.clientWidth, h = Math.round(w * aspect), dpr = window.devicePixelRatio || 1;
+  cv.width = w * dpr; cv.height = h * dpr; cv.style.height = h + "px";
+  const ctx = cv.getContext("2d");
+  ctx.scale(dpr, dpr);
+  return [ctx, w, h];
+}
+
+function speedColor(v, vmin, vmax) {  // blue (slow) -> green -> yellow -> red (fast)
+  const u = Math.max(0, Math.min(1, (v - vmin) / (vmax - vmin || 1)));
+  return `hsl(${Math.round(230 - 230 * u)},85%,${45 + 5 * Math.sin(u * Math.PI)}%)`;
+}
+
+function drawMap() {
+  const cv = $("#map");
+  let xs = Array.from(R.x), ys = Array.from(R.y);
+  if (R.outline) { xs = xs.concat(R.outline[0]); ys = ys.concat(R.outline[1]); }
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const [ctx, w, h] = setupCanvas(cv, Math.min(1.4, Math.max(0.6, (maxY - minY) / (maxX - minX || 1))));
+  const pad = 14, sc = Math.min((w - 2 * pad) / (maxX - minX || 1), (h - 2 * pad) / (maxY - minY || 1));
+  const ox = (w - sc * (maxX - minX)) / 2, oy = (h - sc * (maxY - minY)) / 2;
+  const P = (x, y) => [ox + (x - minX) * sc, h - oy - (y - minY) * sc];
+  ctx.lineCap = ctx.lineJoin = "round";
+  if (R.outline) {
+    ctx.strokeStyle = css("--line"); ctx.lineWidth = 12 * Math.min(1, sc);
+    ctx.beginPath();
+    R.outline[0].forEach((x, i) => { const [px, py] = P(x, R.outline[1][i]); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); });
+    ctx.closePath(); ctx.stroke();
+  }
+  // Selected laps coloured by speed, or the whole session if no laps.
+  const ranges = R.laps.filter(l => shownLaps.has(l.number)).map(l => [l.i0, l.i1]);
+  if (!ranges.length) ranges.push([0, R.n - 1]);
+  const vmin = Math.min(...R.speed.filter(v => v > 5)), vmax = R.vmax;
+  ctx.lineWidth = 3;
+  for (const [a, b] of ranges) for (let i = a; i < b; i++) {
+    if (R.t[i + 1] - R.t[i] > 1) continue;
+    ctx.strokeStyle = speedColor(R.speed[i], vmin, vmax);
+    ctx.beginPath(); ctx.moveTo(...P(R.x[i], R.y[i])); ctx.lineTo(...P(R.x[i + 1], R.y[i + 1])); ctx.stroke();
+  }
+  ctx.font = "600 11px system-ui"; ctx.fillStyle = css("--fg"); ctx.strokeStyle = css("--fg"); ctx.lineWidth = 2;
+  for (const g of R.gates) {
+    const h2 = g.width / 2, a = P(g.x - g.hy * h2, g.y + g.hx * h2), b = P(g.x + g.hy * h2, g.y - g.hx * h2);
+    ctx.beginPath(); ctx.moveTo(...a); ctx.lineTo(...b); ctx.stroke();
+    ctx.fillText(g.name, b[0] + 3, b[1]);
+  }
+  if (R.track && R.track.corners && R.outline) {
+    ctx.font = "12px system-ui"; ctx.textAlign = "center"; ctx.fillStyle = css("--muted");
+    const [cx, cy] = R.outline, n = cx.length;
+    for (const c of R.track.corners) {  // label at mid-corner, pushed to the inside
+      const mid = R.track.finish_m + (c.start_m + c.end_m) / 2;
+      let cum = 0, total = 0;
+      for (let i = 0; i < n; i++) total += Math.hypot(cx[(i + 1) % n] - cx[i], cy[(i + 1) % n] - cy[i]);
+      const d = mid % total;
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n, seg = Math.hypot(cx[j] - cx[i], cy[j] - cy[i]);
+        if (cum + seg >= d) {
+          const u = (d - cum) / seg, hx = (cx[j] - cx[i]) / seg, hy = (cy[j] - cy[i]) / seg;
+          const side = c.dir.startsWith("G") ? -1 : 1;
+          const [px, py] = P(cx[i] + u * (cx[j] - cx[i]) + side * hy * 35, cy[i] + u * (cy[j] - cy[i]) - side * hx * 35);
+          ctx.fillText(c.name, px, py + 4);
+          break;
+        }
+        cum += seg;
+      }
+    }
+    ctx.textAlign = "start";
+  }
+}
+
+function lapProfile(l) {
+  const d = [0], v = [], lean = [];
+  for (let i = l.i0; i <= l.i1; i++) {
+    if (i > l.i0) d.push(d[d.length - 1] + Math.hypot(R.x[i] - R.x[i - 1], R.y[i] - R.y[i - 1]));
+    v.push(R.speed[i]); lean.push(R.lean[i]);
+  }
+  return { d, v, lean };
+}
+
+function drawChart() {
+  const cv = $("#chart");
+  const [ctx, w, h] = setupCanvas(cv, 0.75);
+  const laps = R.laps.filter(l => shownLaps.has(l.number));
+  if (!laps.length) return;
+  const profs = laps.map(lapProfile);
+  const dmax = Math.max(...profs.map(p => p.d[p.d.length - 1]));
+  const vmax = Math.ceil(Math.max(...profs.map(p => Math.max(...p.v))) / 20) * 20;
+  const left = 34, right = 8, h1 = h * 0.62, top2 = h1 + 18, h2 = h - top2 - 18;
+  const X = d => left + (w - left - right) * d / dmax;
+  ctx.font = "11px system-ui"; ctx.fillStyle = css("--muted"); ctx.strokeStyle = css("--line"); ctx.lineWidth = 1;
+  for (let v = 0; v <= vmax; v += 40) {
+    const y = h1 - (h1 - 6) * v / vmax;
+    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(w - right, y); ctx.stroke(); ctx.fillText(v, 2, y + 4);
+  }
+  const LMAX = 60;
+  for (const a of [-LMAX, -30, 0, 30, LMAX]) {
+    const y = top2 + h2 / 2 - (h2 / 2) * a / LMAX;
+    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(w - right, y); ctx.stroke(); ctx.fillText(a + "°", 2, y + 4);
+  }
+  ctx.fillText("km/h", left + 4, 12);
+  ctx.fillText("angle (GPS)  ← gauche · droite →", left + 4, top2 - 4);
+  // corner bands
+  if (R.track && R.track.corners) {
+    ctx.fillStyle = css("--muted"); ctx.globalAlpha = 0.12;
+    for (const c of R.track.corners) ctx.fillRect(X(c.start_m), 0, X(c.end_m) - X(c.start_m), h - 14);
+    ctx.globalAlpha = 1;
+    for (const c of R.track.corners) ctx.fillText(c.name[0], X((c.start_m + c.end_m) / 2) - 3, h - 2);
+  }
+  laps.forEach((l, k) => {
+    const p = profs[k];
+    ctx.strokeStyle = lapColor(l); ctx.lineWidth = l === R.best ? 2.2 : 1.4;
+    ctx.beginPath();
+    p.d.forEach((d, i) => { const y = h1 - (h1 - 6) * p.v[i] / vmax; i ? ctx.lineTo(X(d), y) : ctx.moveTo(X(d), y); });
+    ctx.stroke();
+    ctx.beginPath();
+    let pen = false;
+    p.d.forEach((d, i) => {
+      const a = p.lean[i];
+      if (!isFinite(a)) { pen = false; return; }
+      const y = top2 + h2 / 2 - (h2 / 2) * Math.max(-LMAX, Math.min(LMAX, a)) / LMAX;
+      pen ? ctx.lineTo(X(d), y) : ctx.moveTo(X(d), y);
+      pen = true;
+    });
+    ctx.stroke();
+  });
+}
+
+window.addEventListener("resize", () => { if (R && !R.error) { drawMap(); if (R.laps.length) drawChart(); } });
+refreshStatus(); loadFiles();
+setInterval(refreshStatus, 3000);
+</script>
+</body>
+</html>

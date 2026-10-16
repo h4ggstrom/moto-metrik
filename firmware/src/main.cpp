@@ -1,7 +1,8 @@
 // moto-metrik: GPS + IMU logger.
 // Valid NMEA sentences from the GPS and raw IMU samples ($PIMU) are written to
-// the SD card (one file per boot). All analysis happens offline with
-// tools/analyze.py.
+// the SD card, one file per session. Between sessions (paddock) the box runs a
+// Wi-Fi access point with a page that analyses the sessions on the phone.
+// Full offline analysis: tools/analyze.py.
 
 #include <Arduino.h>
 #include <SD.h>
@@ -12,6 +13,7 @@
 
 #include "config.h"
 #include "imu.h"
+#include "web.h"
 
 static HardwareSerial &gpsSerial = Serial2;
 static SPIClass sdSpi(VSPI);
@@ -19,7 +21,10 @@ static TinyGPSPlus gps;
 
 static File logFile;
 static char logPath[40];
-static bool sdOk = false;
+static bool sdOk = false;       // a log file is open and writable
+static bool sdMounted = false;
+static bool logging = false;    // in a session (else: paddock, Wi-Fi on)
+static bool sessionManual = false;  // started by button/page: no auto stop
 static bool clockSet = false;
 static uint32_t lastFlush = 0;
 static uint32_t bytesLogged = 0;
@@ -191,7 +196,7 @@ static uint32_t gpsProbeBaud() {
 // stopped answering (loose wire, card pulled): flag it, sdRecover() takes over.
 static uint32_t sdFailures = 0;
 static void logWrite(const uint8_t *buf, size_t len) {
-  if (!sdOk) return;
+  if (!sdOk || !logging) return;
   if (logFile.write(buf, len) != len) {
     sdOk = false;
     sdFailures++;
@@ -260,7 +265,104 @@ static void gpsReportVersion() {
 
 // Find the GPS baud rate and push our settings. Also used to recover a GPS
 // that lost power mid-session: it then reboots on factory settings (9600 baud, 1 Hz).
+static volatile uint32_t lastValidSentence = 0;  // millis() of the last valid sentence (reader task)
+static uint32_t rmcCount = 0;           // one RMC per navigation epoch
+
+static int hexVal(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+static bool nmeaChecksumOk(const char *line, size_t len) {
+  // $<body>*HH
+  if (len < 4 || line[0] != '$') return false;
+  uint8_t sum = 0;
+  size_t i = 1;
+  for (; i < len && line[i] != '*'; i++) sum ^= (uint8_t)line[i];
+  if (i + 3 != len) return false;
+  int hi = hexVal(line[i + 1]), lo = hexVal(line[i + 2]);
+  return hi >= 0 && lo >= 0 && sum == (uint8_t)(hi << 4 | lo);
+}
+
+// The GPS UART is read by a task that preempts the main loop, so each
+// sentence is timestamped when it arrives, not when the loop gets round to it
+// after an SD write. Valid sentences go through a queue to the main loop.
+struct NmeaLine {
+  uint32_t ms;  // millis() when the '$' was received
+  uint8_t len;
+  char text[126];
+};
+static QueueHandle_t nmeaQueue = nullptr;
+static volatile bool gpsReaderPaused = true;  // gpsConfigure() talks to the UART itself
+static volatile uint32_t nmeaDropped = 0;
+
+static void gpsReaderTask(void *) {
+  NmeaLine cur{};
+  size_t len = 0;
+  for (;;) {
+    if (gpsReaderPaused || !gpsSerial.available()) {
+      if (gpsReaderPaused) len = 0;
+      vTaskDelay(1);
+      continue;
+    }
+    while (!gpsReaderPaused && gpsSerial.available()) {
+      char c = gpsSerial.read();
+      if (c == '$') {  // start of sentence: drop any unfinished one
+        cur.ms = millis();
+        len = 0;
+        cur.text[len++] = c;
+      } else if (len == 0 || c == '\r') {
+        // outside a sentence (noise, UBX binary) or CR
+      } else if (c == '\n') {
+        if (nmeaChecksumOk(cur.text, len)) {
+          lastValidSentence = millis();  // here, not in loop(): the loop may be busy serving a file
+          cur.len = len;
+          if (xQueueSend(nmeaQueue, &cur, 0) != pdTRUE) nmeaDropped++;
+        }
+        len = 0;
+      } else if (c < 0x20 || c > 0x7E || len >= sizeof(cur.text) - 2) {
+        len = 0;  // not text: noise
+      } else {
+        cur.text[len++] = c;
+      }
+    }
+  }
+}
+
+static QueueHandle_t createNmeaQueue() { return xQueueCreate(64, sizeof(NmeaLine)); }
+
+static void gpsReaderPause(bool pause) {
+  gpsReaderPaused = pause;
+  delay(5);  // let the task see it before the caller touches the UART
+}
+
+// Main loop side: log a sentence received by the reader task.
+static void handleNmea(NmeaLine &l) {
+  for (int i = 0; i < l.len; i++) gps.encode(l.text[i]);
+  gps.encode('\r');
+  gps.encode('\n');
+  lastValidSentence = millis();
+  if (l.len > 6 && memcmp(l.text + 3, "RMC", 3) == 0) {
+    rmcCount++;
+    // Reception time of this epoch, to align IMU samples with GPS time.
+    char t[40];
+    logSentence(t, snprintf(t, sizeof(t), "$PTRX,%u", l.ms), sizeof(t));
+  }
+  l.text[l.len] = '\r';
+  l.text[l.len + 1] = '\n';
+  logWrite((const uint8_t *)l.text, l.len + 2);
+}
+
+static bool gpsConfigureLocked();
 static bool gpsConfigure() {
+  gpsReaderPause(true);
+  bool ok = gpsConfigureLocked();
+  gpsReaderPause(false);
+  return ok;
+}
+
+static bool gpsConfigureLocked() {
   uint32_t baud = gpsProbeBaud();
   if (!baud) {
     Serial.println("[gps] no NMEA on any baud rate - check wiring (GPS TX -> GPIO16)");
@@ -303,8 +405,11 @@ static bool gpsConfigure() {
 }
 
 static void gpsInit() {
-  gpsSerial.setRxBufferSize(4096);  // absorbs SD write latency spikes
+  gpsSerial.setRxBufferSize(4096);
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  nmeaQueue = createNmeaQueue();
+  // Higher priority than loop() (1) on the same core: preempts SD writes.
+  xTaskCreatePinnedToCore(gpsReaderTask, "gps", 4096, nullptr, 3, nullptr, 1);
   gpsConfigure();
 }
 
@@ -354,19 +459,21 @@ static void sdInit() {
     Serial.println("[sd] mount failed");
     return;
   }
+  sdMounted = true;
   Serial.printf("[sd] card %llu MB\n", SD.cardSize() / (1024 * 1024));
-  sdOpenNew();
 }
 
 // Card lost (or never mounted): retry every SD_RECOVER_MS. On success, logging
 // resumes in a new file that starts with the session metadata.
 static void sdRecover() {
   static uint32_t lastAttempt = 0;
-  if (sdOk || millis() - lastAttempt < SD_RECOVER_MS) return;
+  bool needed = logging ? !sdOk : !sdMounted;  // paddock: the page needs the card
+  if (!needed || millis() - lastAttempt < SD_RECOVER_MS) return;
   lastAttempt = millis();
   logFile.close();
   SD.end();
-  if (!sdMount(1)) return;
+  sdMounted = sdMount(1);
+  if (!sdMounted || !logging) return;
   if (!sdOpenNew()) return;
   char t[60];
   logSentence(t, snprintf(t, sizeof(t), "$PMMK,RESUMED,failures=%u", sdFailures), sizeof(t));
@@ -378,19 +485,75 @@ static void sdRecover() {
 // log and starts a new one, to split sessions without unplugging.
 static uint32_t ledAckUntil = 0;  // LED acknowledgement blink window
 
-static void newSession() {
+static void startSession(bool manual);
+static void endSession();
+
+static WebStatus webStatus() {
+  bool fix = gps.location.isValid() && gps.location.age() < 2000;
+  uint32_t freeMb = sdMounted ? (uint32_t)((SD.totalBytes() - SD.usedBytes()) / (1024 * 1024)) : 0;
+  extern uint32_t lastHz;
+  return {fix, (int)gps.satellites.value(), (int)lastHz, imuOk, sdMounted, freeMb, logging};
+}
+
+static void startSessionFromPage() { startSession(true); }
+
+// Paddock: no log file, Wi-Fi + page up.
+static void endSession() {
   if (sdOk) {
     char t[40];
     logSentence(t, snprintf(t, sizeof(t), "$PMMK,SESSION_END"), sizeof(t));
     logFile.close();
+    Serial.printf("[session] closed %s\n", logPath);
   }
   sdOk = false;
-  if (!sdOpenNew()) return;  // sdRecover() retries if the card is gone
-  char t[40];
-  logSentence(t, snprintf(t, sizeof(t), "$PMMK,SESSION_START,button"), sizeof(t));
+  logging = false;
+#if WEB_ENABLED
+  webStart({webStatus, startSessionFromPage});
+#endif
+}
+
+static void startSession(bool manual) {
+#if WEB_ENABLED
+  webStop();
+#endif
+  if (sdOk) endSession();
+  logging = true;
+  sessionManual = manual;
+  if (!sdMounted) return;  // sdRecover() opens the file once the card answers
+  if (!sdOpenNew()) return;
+  char t[48];
+  logSentence(t, snprintf(t, sizeof(t), "$PMMK,SESSION_START,%s", manual ? "manual" : "auto"), sizeof(t));
   for (int i = 0; i < nInfo; i++) logWrite((const uint8_t *)infoLines[i], strlen(infoLines[i]));
   ledAckUntil = millis() + 1500;
-  Serial.println("[session] new log started by button");
+  Serial.printf("[session] %s start\n", manual ? "manual" : "auto");
+}
+
+// Auto sessions: start when the bike rolls, end after a stop in the paddock.
+static void sessionAuto() {
+#if WEB_ENABLED
+  static uint32_t movingSince = 0, stillSince = 0;
+  bool fix = gps.location.isValid() && gps.location.age() < 2000;
+  float v = gps.speed.kmph();
+  uint32_t now = millis();
+  if (!logging) {
+    if (fix && v > SESSION_START_KMH) {
+      if (!movingSince) movingSince = now;
+      if (now - movingSince > 2000) startSession(false);
+    } else {
+      movingSince = 0;
+    }
+    stillSince = 0;
+  } else if (!sessionManual) {
+    // Only a fix can tell "stopped": without one (GPS lost) keep logging.
+    if (fix && v < 3) {
+      if (!stillSince) stillSince = now;
+      if (now - stillSince > SESSION_STOP_S * 1000UL) endSession();
+    } else {
+      stillSince = 0;
+    }
+    movingSince = 0;
+  }
+#endif
 }
 
 static void pollButton() {
@@ -401,7 +564,12 @@ static void pollButton() {
   // Act on release after >= 50 ms (debounce), at most once every 3 s.
   if (!down && wasDown && millis() - downSince >= 50 && millis() - lastPress > 3000) {
     lastPress = millis();
-    newSession();
+    if (logging) {
+      endSession();
+      ledAckUntil = millis() + 1500;
+    } else {
+      startSession(true);
+    }
   }
   wasDown = down;
 }
@@ -410,61 +578,6 @@ static void pollButton() {
 // NMEA line filter: only complete sentences with a valid checksum reach the
 // SD card. A loose wire floods the UART with noise, which must not be logged.
 // ---------------------------------------------------------------------------
-
-static char nmeaLine[128];
-static size_t nmeaLen = 0;
-static uint32_t lastValidSentence = 0;  // millis() of the last valid sentence
-static uint32_t rmcCount = 0;           // one RMC per navigation epoch
-static uint32_t nmeaStartMs = 0;        // millis() when the current sentence's '$' was read
-
-static int hexVal(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return -1;
-}
-
-static bool nmeaChecksumOk(const char *line, size_t len) {
-  // $<body>*HH
-  if (len < 4 || line[0] != '$') return false;
-  uint8_t sum = 0;
-  size_t i = 1;
-  for (; i < len && line[i] != '*'; i++) sum ^= (uint8_t)line[i];
-  if (i + 3 != len) return false;
-  int hi = hexVal(line[i + 1]), lo = hexVal(line[i + 2]);
-  return hi >= 0 && lo >= 0 && sum == (uint8_t)(hi << 4 | lo);
-}
-
-static void nmeaFeed(char c) {
-  if (c == '$') {  // start of sentence: drop any unfinished one
-    nmeaStartMs = millis();
-    nmeaLen = 0;
-    nmeaLine[nmeaLen++] = c;
-    return;
-  }
-  if (nmeaLen == 0) return;  // outside a sentence (noise, UBX binary)
-  if (c == '\r') return;
-  if (c == '\n') {
-    if (nmeaChecksumOk(nmeaLine, nmeaLen)) {
-      lastValidSentence = millis();
-      if (nmeaLen > 6 && memcmp(nmeaLine + 3, "RMC", 3) == 0) {
-        rmcCount++;
-        // Reception time of this epoch, to align IMU samples with GPS time.
-        char t[40];
-        logSentence(t, snprintf(t, sizeof(t), "$PTRX,%u", nmeaStartMs), sizeof(t));
-      }
-      nmeaLine[nmeaLen] = '\r';  // room left: nmeaLen < sizeof(nmeaLine) - 1
-      nmeaLine[nmeaLen + 1] = '\n';
-      logWrite((const uint8_t *)nmeaLine, nmeaLen + 2);
-    }
-    nmeaLen = 0;
-    return;
-  }
-  if (c < 0x20 || c > 0x7E || nmeaLen >= sizeof(nmeaLine) - 2) {
-    nmeaLen = 0;  // not text: noise
-    return;
-  }
-  nmeaLine[nmeaLen++] = c;
-}
 
 static bool gpsSilent() { return millis() - lastValidSentence > GPS_SILENT_MS; }
 
@@ -553,13 +666,17 @@ static void updateLed() {
   uint32_t now = millis();
   uint32_t phase = now % 1000;
   bool on;
-  if (now < ledAckUntil) on = (now / 60) % 2;  // new session acknowledged: flicker
-  else if (!sdOk) on = (now / 100) % 2;
-  else if (gpsSilent()) on = phase < 100 || (phase >= 200 && phase < 300);
-  else if (!gps.location.isValid() || gps.location.age() > 2000) on = (now / 500) % 2;
-  else on = true;
+  bool fix = gps.location.isValid() && gps.location.age() < 2000;
+  if (now < ledAckUntil) on = (now / 60) % 2;          // button acknowledged: flicker
+  else if (logging ? !sdOk : !sdMounted) on = (now / 100) % 2;  // SD error: fast blink
+  else if (gpsSilent()) on = phase < 100 || (phase >= 200 && phase < 300);  // GPS mute: double blink
+  else if (!logging) on = fix ? now % 2000 < 100 : phase < 100;  // paddock: short flash (2 s = fix ok)
+  else if (!fix) on = (now / 500) % 2;                  // session, waiting for fix: slow blink
+  else on = true;                                       // session, logging with fix
   digitalWrite(LED_PIN, on);
 }
+
+uint32_t lastHz = 0;
 
 static void printStatus() {
   static uint32_t last = 0;
@@ -568,11 +685,12 @@ static void printStatus() {
   last = millis();
   float hz = rmcCount - lastRmc;  // RMC per second = navigation rate
   lastRmc = rmcCount;
+  lastHz = hz;
   static uint32_t lastImu = 0;
   uint32_t imuHz = imuSamples() - lastImu;
   lastImu = imuSamples();
-  Serial.printf("[status] fix=%d hz=%.0f sats=%u hdop=%.1f speed=%.1fkm/h imu=%s/%uHz err=%u drop=%u logged=%uB\n",
-                gps.location.isValid() && gps.location.age() < 2000, hz, gps.satellites.value(),
+  Serial.printf("[status] %s fix=%d hz=%.0f sats=%u hdop=%.1f speed=%.1fkm/h imu=%s/%uHz err=%u drop=%u logged=%uB\n",
+                logging ? "LOG" : "PADDOCK", gps.location.isValid() && gps.location.age() < 2000, hz, gps.satellites.value(),
                 gps.hdop.hdop(), gps.speed.kmph(), imuOk ? "ok" : "off", imuHz, imuErrors(), imuDropped(),
                 bytesLogged);
 }
@@ -595,14 +713,16 @@ void setup() {
   logInfo(info);
 #endif
   lastValidSentence = millis();  // grace period before the watchdog kicks in
+#if WEB_ENABLED
+  endSession();  // start in the paddock: Wi-Fi up, a session starts when the bike rolls
+#else
+  startSession(true);  // no Wi-Fi: log from power-up as before
+#endif
 }
 
 void loop() {
-  while (gpsSerial.available()) {
-    char c = gpsSerial.read();
-    gps.encode(c);
-    nmeaFeed(c);
-  }
+  NmeaLine line;
+  while (xQueueReceive(nmeaQueue, &line, 0) == pdTRUE) handleNmea(line);
 
   ImuSample m;
   while (imuPop(m)) {
@@ -617,6 +737,10 @@ void loop() {
   }
   sdRecover();
   pollButton();
+  sessionAuto();
+#if WEB_ENABLED
+  webLoop();
+#endif
 
   gpsWatchdog();
   syncClockAndRename();

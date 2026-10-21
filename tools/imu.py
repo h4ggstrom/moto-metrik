@@ -115,9 +115,13 @@ def imu_dynamics(imu: ImuData, t_gps, speed_kmh, a_lon_gps, yaw_gps_dps) -> ImuD
     a_gps = np.interp(imu.t, t_gps, np.nan_to_num(a_lon_gps))
     yaw_g = np.interp(imu.t, t_gps, np.nan_to_num(yaw_gps_dps))
 
+    # Gyro bias from stops; a ride that never stops falls back on straights,
+    # where roll/pitch/yaw rates average out to zero.
     still = v < 0.3
     if still.sum() < fs * 2:
-        return None
+        still = (v > 30 / 3.6) & (np.abs(yaw_g) < 2)
+        if still.sum() < fs * 10:
+            return None
     gyro -= np.median(gyro[still], axis=0)
     gyro = lowpass(gyro, fs, 8.0)
 

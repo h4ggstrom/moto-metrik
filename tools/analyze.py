@@ -554,7 +554,9 @@ def main() -> int:
             both = np.isfinite(lean_gps) & (speed > 30)
             if both.any():
                 print(f"[imu] lean IMU vs GPS: median |diff| {np.median(np.abs(dyn.lean[both] - lean_gps[both])):.1f} deg")
-            lean, a_lat, a_lon = dyn.lean, dyn.a_lat, dyn.a_lon
+            # a_lon stays GPS: chassis vibration aliased into the 100 Hz IMU
+            # stream shows up as bogus 2 g bursts, while Doppler speed is clean.
+            lean, a_lat = dyn.lean, median(dyn.a_lat, 5)
             lean[speed < 15] = np.nan
     # Beyond what track-day tyres allow: GPS course lag/catch-up in tight hairpins.
     implausible = np.abs(lean) > 62

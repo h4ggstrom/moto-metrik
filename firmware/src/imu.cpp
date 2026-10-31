@@ -42,11 +42,12 @@ static bool configure() {
   delay(20);
   ok &= writeReg(PWR_MGMT_2, 0x00);  // accel + gyro on
   ok &= bank(2);
-  // Internal ODR ~220 Hz, DLPF ~50 Hz: anti-aliasing for 100 Hz reads.
+  // Internal ODR ~220 Hz. DLPF well under the 50 Hz Nyquist of our 100 Hz reads:
+  // at 50 Hz, engine vibration aliased into fake multi-g longitudinal bursts.
   ok &= writeReg(GYRO_SMPLRT_DIV, 4);                                      // 1.1 kHz / 5
-  ok &= writeReg(GYRO_CONFIG_1, (3 << 3) | (IMU_GYRO_FS_SEL << 1) | 0x01);  // DLPF 51 Hz
+  ok &= writeReg(GYRO_CONFIG_1, (4 << 3) | (IMU_GYRO_FS_SEL << 1) | 0x01);  // DLPF 24 Hz
   ok &= writeReg(ACCEL_SMPLRT_DIV_2, 4);                                   // 1.125 kHz / 5
-  ok &= writeReg(ACCEL_CONFIG, (3 << 3) | (IMU_ACCEL_FS_SEL << 1) | 0x01);  // DLPF 50 Hz
+  ok &= writeReg(ACCEL_CONFIG, (5 << 3) | (IMU_ACCEL_FS_SEL << 1) | 0x01);  // DLPF 12 Hz
   ok &= bank(0);
   return ok;
 }

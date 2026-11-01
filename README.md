@@ -28,6 +28,18 @@ Le GPS et l'IMU partagent le 3V3 et un GND (épissures en Y soudées, une seule 
 | SD | SCK | blanc | GPIO18 |
 | SD | CS | gris | GPIO5 |
 
+Optionnel, lecture du bus CAN de la moto (écoute seule, le boîtier n'émet jamais) : transceiver SN65HVD230 en 3V3.
+
+| Module | Broche module | ESP32 / moto |
+|---|---|---|
+| CAN | 3V3 | 3V3 |
+| CAN | GND | GND (et masse de la moto) |
+| CAN | CTX (D) | GPIO32 |
+| CAN | CRX (R) | GPIO33 |
+| CAN | CANH / CANL | CAN-H / CAN-L de la prise diagnostic |
+
+Le débit (125 k à 1 Mbit/s) est détecté automatiquement. Trames enregistrées en `$PCAN,ms,ID,DATA` ; `tools/can_sniff.py LOG.nmea` liste les identifiants et classe les octets selon leur corrélation avec la vitesse GPS, l'accélération et l'angle.
+
 Ne pas brancher le GPS sur RX0/TX0 : ces broches sont reliées au convertisseur USB-série (conflit upload/moniteur).
 Pins modifiables dans `firmware/include/config.h`.
 

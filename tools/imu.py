@@ -48,9 +48,10 @@ def nmea_ok(line: str) -> bool:
         return False
 
 
-def load_imu(path: Path) -> ImuData | None:
+def read_log(path: Path):
+    """Raw $PIMU rows, ($PTRX ms, RMC UTC) pairs, $PCAN rows and IMU scales."""
     acc_lsb, gyro_lsb = 4096.0, 32.8
-    raw, pairs = [], []
+    raw, pairs, can = [], [], []
     pending_ms = None
     with open(path, "r", encoding="ascii", errors="replace") as f:
         for line in f:
@@ -61,6 +62,8 @@ def load_imu(path: Path) -> ImuData | None:
             fields = body.split(",")
             if fields[0] == "PIMU" and len(fields) == 9:
                 raw.append([int(v) for v in fields[1:]])
+            elif fields[0] == "PCAN" and len(fields) == 4:
+                can.append((int(fields[1]), int(fields[2], 16), bytes.fromhex(fields[3])))
             elif fields[0] == "PTRX":
                 pending_ms = int(fields[1])
             elif fields[0].endswith("RMC"):
@@ -73,9 +76,11 @@ def load_imu(path: Path) -> ImuData | None:
                 kv = dict(x.split("=") for x in fields[3:] if "=" in x)
                 acc_lsb = float(kv.get("accel_lsb_per_g", acc_lsb))
                 gyro_lsb = float(kv.get("gyro_lsb_per_dps", gyro_lsb))
-    if len(raw) < 1000 or len(pairs) < 50:
-        return None
-    raw = np.array(raw, dtype=float)
+    return raw, pairs, can, acc_lsb, gyro_lsb
+
+
+def clock_fit(pairs):
+    """Robust linear fit ESP32 millis() -> UTC epoch: (a, b, p95 residual ms)."""
     p = np.array(pairs, dtype=float)
     # Reception = epoch + output delay + small jitter: robust linear fit.
     keep = np.ones(len(p), bool)
@@ -84,8 +89,17 @@ def load_imu(path: Path) -> ImuData | None:
         res = p[:, 1] - (a * p[:, 0] + b)
         keep = np.abs(res - np.median(res[keep])) < max(3 * np.std(res[keep]), 0.005)
     resid = np.percentile(np.abs(res[keep] - np.median(res[keep])), 95) * 1000
+    return a, b, float(resid)
+
+
+def load_imu(path: Path) -> ImuData | None:
+    raw, pairs, _, acc_lsb, gyro_lsb = read_log(path)
+    if len(raw) < 1000 or len(pairs) < 50:
+        return None
+    raw = np.array(raw, dtype=float)
+    a, b, resid = clock_fit(pairs)
     t = a * raw[:, 0] + b
-    return ImuData(t, raw[:, 1:4] / acc_lsb, raw[:, 4:7] / gyro_lsb, float(resid))
+    return ImuData(t, raw[:, 1:4] / acc_lsb, raw[:, 4:7] / gyro_lsb, resid)
 
 
 def lowpass(a, fs: float, fc: float):

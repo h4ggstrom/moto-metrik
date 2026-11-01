@@ -1,5 +1,6 @@
-// moto-metrik: GPS + IMU logger.
-// Valid NMEA sentences from the GPS and raw IMU samples ($PIMU) are written to
+// moto-metrik: GPS + IMU (+ CAN) logger.
+// Valid NMEA sentences from the GPS, raw IMU samples ($PIMU) and frames sniffed
+// on the bike's CAN bus ($PCAN) are written to
 // the SD card, one file per session. Between sessions (paddock) the box runs a
 // Wi-Fi access point with a page that analyses the sessions on the phone.
 // Full offline analysis: tools/analyze.py.
@@ -11,6 +12,7 @@
 #include <sys/time.h>
 #include <time.h>
 
+#include "can.h"
 #include "config.h"
 #include "imu.h"
 #include "web.h"
@@ -689,10 +691,10 @@ static void printStatus() {
   static uint32_t lastImu = 0;
   uint32_t imuHz = imuSamples() - lastImu;
   lastImu = imuSamples();
-  Serial.printf("[status] %s fix=%d hz=%.0f sats=%u hdop=%.1f speed=%.1fkm/h imu=%s/%uHz err=%u drop=%u logged=%uB\n",
+  Serial.printf("[status] %s fix=%d hz=%.0f sats=%u hdop=%.1f speed=%.1fkm/h imu=%s/%uHz err=%u drop=%u can=%u/%u/%u logged=%uB\n",
                 logging ? "LOG" : "PADDOCK", gps.location.isValid() && gps.location.age() < 2000, hz, gps.satellites.value(),
                 gps.hdop.hdop(), gps.speed.kmph(), imuOk ? "ok" : "off", imuHz, imuErrors(), imuDropped(),
-                bytesLogged);
+                canBitrate(), canFrames(), canDropped(), bytesLogged);
 }
 
 void setup() {
@@ -712,6 +714,7 @@ void setup() {
            IMU_RATE_HZ, IMU_ACCEL_LSB_PER_G, IMU_GYRO_LSB_PER_DPS);
   logInfo(info);
 #endif
+  canBegin();
   lastValidSentence = millis();  // grace period before the watchdog kicks in
 #if WEB_ENABLED
   endSession();  // start in the paddock: Wi-Fi up, a session starts when the bike rolls
@@ -729,6 +732,21 @@ void loop() {
     char t[80];
     int n = snprintf(t, sizeof(t), "$PIMU,%u,%d,%d,%d,%d,%d,%d,%d", m.ms, m.ax, m.ay, m.az, m.gx, m.gy, m.gz, m.temp);
     logSentence(t, n, sizeof(t));
+  }
+
+  CanFrame c;
+  while (canPop(c)) {
+    char t[64];
+    int n = snprintf(t, sizeof(t), c.ext ? "$PCAN,%u,%08X," : "$PCAN,%u,%03X,", c.ms, c.id);
+    for (int i = 0; i < c.dlc; i++) n += snprintf(t + n, sizeof(t) - n, "%02X", c.data[i]);
+    logSentence(t, n, sizeof(t));
+  }
+  static bool canInfoDone = false;
+  if (!canInfoDone && canBitrate()) {  // replayed at the top of every later file
+    char info[60];
+    snprintf(info, sizeof(info), "CAN,bitrate=%u,listen_only", canBitrate());
+    logInfo(info);
+    canInfoDone = true;
   }
 
   if (sdOk && millis() - lastFlush >= LOG_FLUSH_MS) {

@@ -55,6 +55,16 @@
 #define IMU_GYRO_LSB_PER_DPS (131.0f / (1 << IMU_GYRO_FS_SEL))
 
 // ---------------------------------------------------------------------------
+// CAN bus sniffer (SN65HVD230 transceiver), listen-only: never transmits.
+// Harmless without a transceiver (RX is pulled up: idle bus, nothing logged).
+// ---------------------------------------------------------------------------
+#define CAN_ENABLED 1
+#define CAN_TX_PIN 32  // to transceiver D/TX (held recessive in listen-only)
+#define CAN_RX_PIN 33  // to transceiver R/RX
+#define CAN_QUEUE_LEN 512
+#define CAN_ID_MIN_MS 10  // log each ID at most every 10 ms (100 Hz)
+
+// ---------------------------------------------------------------------------
 // Status LED (onboard, GPIO2 on most devkits)
 // ---------------------------------------------------------------------------
 #define LED_PIN 2

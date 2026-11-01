@@ -171,7 +171,7 @@ function render(name) {
       ${stat(R.ideal ? fmtLap(R.ideal) : "--", "tour idéal")}
       ${stat(R.laps.length, "tours complets")}
       ${stat(R.vmax.toFixed(0) + " km/h", "vitesse max")}
-      ${stat(maxAbs(R.lean).toFixed(0) + "°", "angle max (GPS)")}
+      ${stat(maxAbs(R.lean).toFixed(0) + "°", `angle max (${R.leanSource})`)}
       ${stat(fmtDur(R.duration), "durée")}
     </div>
     <p class="muted">${R.n} points · ${R.rateHz.toFixed(0)} Hz · ${R.skippedPct.toFixed(1)} % sautés${fixInfo ? " · " + esc(fixInfo.replace(/,/g, " ")) : ""}</p></div>`;
@@ -352,7 +352,7 @@ function drawChart() {
     ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(w - right, y); ctx.stroke(); ctx.fillText(a + "°", 2, y + 4);
   }
   ctx.fillText("km/h", left + 4, 12);
-  ctx.fillText("angle (GPS)  ← gauche · droite →", left + 4, top2 - 4);
+  ctx.fillText(`angle (${R.leanSource})  ← gauche · droite →`, left + 4, top2 - 4);
   if (byTime) ctx.fillText("temps (s)", w - right - 52, h - 2);
   // corner bands (distance axis only)
   if (!byTime && R.track && R.track.corners) {

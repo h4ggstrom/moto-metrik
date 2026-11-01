@@ -66,6 +66,17 @@ static void sendFile() {
   f.close();
 }
 
+// Answer the phones' connectivity probes as if the Internet were reachable:
+// a phone that believes this Wi-Fi is offline sends the page's requests over
+// 4G/5G instead, and they fail. Downside: no captive-portal pop-up, the page
+// is opened by hand at http://192.168.4.1.
+static void sendNoContent() { server.send(204); }
+static void sendAppleSuccess() {
+  server.send(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+}
+static void sendMsftTest() { server.send(200, "text/plain", "Microsoft Connect Test"); }
+static void sendMsftNcsi() { server.send(200, "text/plain", "Microsoft NCSI"); }
+
 static void startSession() {
   server.send(200, "text/plain", "ok");
   delay(200);  // let the answer leave before the Wi-Fi goes down
@@ -84,7 +95,13 @@ void webStart(const WebHooks &h) {
     server.on("/api/files", sendFiles);
     server.on("/api/file", sendFile);
     server.on("/api/session/new", HTTP_POST, startSession);
-    server.onNotFound(sendPage);  // captive-portal probes land on the page
+    server.on("/generate_204", sendNoContent);  // Android
+    server.on("/gen_204", sendNoContent);
+    server.on("/hotspot-detect.html", sendAppleSuccess);  // iOS, macOS
+    server.on("/library/test/success.html", sendAppleSuccess);
+    server.on("/connecttest.txt", sendMsftTest);  // Windows
+    server.on("/ncsi.txt", sendMsftNcsi);
+    server.onNotFound(sendPage);  // any other URL lands on the page
     routesSet = true;
   }
   server.begin();

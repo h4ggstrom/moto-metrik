@@ -295,6 +295,7 @@ function imuDynamics(imu, tGps, speedKmh, aLonGps, yawGpsDps) {
     phi = out;
   }
   let aLat = lowpass(Array.from(v, (x, i) => x * yaw[i] * D / G), fs, 2.0);
+  const aLon = lowpass(Array.from(v, (_, i) => dot3(fwd, A(i))), fs, 2.0);
 
   // Mounting sign ambiguity: the IMU yaw must agree with the GPS one in turns.
   let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, k = 0;
@@ -306,7 +307,7 @@ function imuDynamics(imu, tGps, speedKmh, aLonGps, yawGpsDps) {
   const corr = k > 50 ? (k * sxy - sx * sy) / Math.sqrt((k * sxx - sx * sx) * (k * syy - sy * sy)) : NaN;
   if (corr < 0) { phi = phi.map(x => -x); aLat = aLat.map(x => -x); }
 
-  return { lean: interpSorted(tGps, imu.t, phi), aLat: interpSorted(tGps, imu.t, aLat),
+  return { lean: interpSorted(tGps, imu.t, phi), aLat: interpSorted(tGps, imu.t, aLat), aLon: interpSorted(tGps, imu.t, aLon),
            syncMs: imu.syncMs, corr: Math.abs(corr) };
 }
 
@@ -421,8 +422,17 @@ function analyze(text, tracks) {
     const yawGps = gradient(heading, t).map(r => r * 180 / Math.PI);
     const d = imuDynamics(imu, t, speed, dyn.aLon, yawGps);
     if (d) {
-      // a_lon stays GPS: vibration aliasing makes the IMU one unreliable.
       const aLat = median(d.aLat, 5);
+      // IMU a_lon only when it tracks the GPS one (logs from before the IMU
+      // low-pass fix carry aliased vibration); then it beats GPS speed jumps.
+      let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, k = 0;
+      for (let i = 0; i < n; i++) {
+        if (!(speed[i] > 30) || !isFinite(dyn.aLon[i])) continue;
+        const x = dyn.aLon[i], y = d.aLon[i];
+        sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; k++;
+      }
+      const c = k > 100 ? (k * sxy - sx * sy) / Math.sqrt((k * sxx - sx * sx) * (k * syy - sy * sy)) : 0;
+      if (c >= 0.95) dyn.aLon = d.aLon;
       for (let i = 0; i < n; i++) {
         const bad = speed[i] < 15 || Math.abs(d.lean[i]) > 62;
         dyn.lean[i] = bad ? NaN : d.lean[i];

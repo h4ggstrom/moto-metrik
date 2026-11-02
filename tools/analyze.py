@@ -554,9 +554,15 @@ def main() -> int:
             both = np.isfinite(lean_gps) & (speed > 30)
             if both.any():
                 print(f"[imu] lean IMU vs GPS: median |diff| {np.median(np.abs(dyn.lean[both] - lean_gps[both])):.1f} deg")
-            # a_lon stays GPS: chassis vibration aliased into the 100 Hz IMU
-            # stream shows up as bogus 2 g bursts, while Doppler speed is clean.
+            # IMU a_lon only when it tracks the GPS one: logs recorded before the
+            # IMU low-pass fix carry aliased vibration (bogus 2 g bursts). The
+            # IMU then beats GPS, whose speed can jump by a few km/h in one epoch.
             lean, a_lat = dyn.lean, median(dyn.a_lat, 5)
+            both = np.isfinite(a_lon) & (speed > 30)
+            c = np.corrcoef(a_lon[both], dyn.a_lon[both])[0, 1] if both.sum() > 100 else 0.0
+            print(f"[imu] a_lon IMU vs GPS corr {c:.2f}: {'IMU' if c >= 0.95 else 'GPS'} used")
+            if c >= 0.95:
+                a_lon = dyn.a_lon
             lean[speed < 15] = np.nan
     # Beyond what track-day tyres allow: GPS course lag/catch-up in tight hairpins.
     implausible = np.abs(lean) > 62

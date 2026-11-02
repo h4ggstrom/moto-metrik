@@ -168,6 +168,8 @@ class Telemetry:
     gps_utc: list  # (video time of payload start, UTC epoch from GPSU)
     acc_t: np.ndarray  # video time of each accelerometer sample, s
     acc: np.ndarray  # (n, 3) m/s^2, camera frame
+    gyro_t: np.ndarray  # video time of each gyro sample, s
+    gyro: np.ndarray  # (n, 3) rad/s, camera frame
 
 
 def read_telemetry(path: Path) -> Telemetry:
@@ -175,7 +177,7 @@ def read_telemetry(path: Path) -> Telemetry:
     meta = next((t for t in tracks if t.fmt == b"gpmd"), None)
     if meta is None:
         raise ValueError(f"{path}: no GPMF track")
-    gps_t, gps, fix, utc, acc_t, acc = [], [], [], [], [], []
+    gps_t, gps, fix, utc, acc_t, acc, gyro_t, gyro = [], [], [], [], [], [], [], []
     with open(path, "rb") as f:
         for t0, dur, off, size in zip(meta.times, meta.durs, meta.offsets, meta.sizes):
             f.seek(off)
@@ -194,7 +196,7 @@ def read_telemetry(path: Path) -> Telemetry:
                             gpsf = int(_values(buf, typ, ssize, rep, da).ravel()[0])
                         elif k == b"GPSU":
                             gpsu = _values(buf, typ, ssize, rep, da).decode("ascii", "replace")
-                        elif k in (b"GPS5", b"ACCL"):
+                        elif k in (b"GPS5", b"ACCL", b"GYRO"):
                             rows, kind = _values(buf, typ, ssize, rep, da), k
                     if rows is None or scal is None:
                         continue
@@ -207,13 +209,17 @@ def read_telemetry(path: Path) -> Telemetry:
                         if gpsu:
                             d = dt.datetime.strptime(gpsu[:16], "%y%m%d%H%M%S.%f").replace(tzinfo=dt.timezone.utc)
                             utc.append((t0, d.timestamp()))
-                    else:
+                    elif kind == b"ACCL":
                         acc_t.append(ts)
                         acc.append(vals)
+                    else:
+                        gyro_t.append(ts)
+                        gyro.append(vals)
     g = np.concatenate(gps) if gps else np.zeros((0, 5))
     return Telemetry(np.concatenate(gps_t) if gps_t else np.zeros(0), g[:, 0], g[:, 1], g[:, 3] * 3.6,
                      np.concatenate(fix) if fix else np.zeros(0), utc,
-                     np.concatenate(acc_t) if acc_t else np.zeros(0), np.concatenate(acc) if acc else np.zeros((0, 3)))
+                     np.concatenate(acc_t) if acc_t else np.zeros(0), np.concatenate(acc) if acc else np.zeros((0, 3)),
+                     np.concatenate(gyro_t) if gyro_t else np.zeros(0), np.concatenate(gyro) if gyro else np.zeros((0, 3)))
 
 
 def video_info(path: Path):

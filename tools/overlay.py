@@ -2,8 +2,8 @@
 """Burn moto-metrik data into GoPro onboard footage.
 
 The video is aligned on the log by its own GPS: GoPro GPSU time gives a first
-guess, then the GoPro and logger speed traces are cross-correlated (about two
-frames of accuracy). The overlay shows, live:
+guess, the GoPro and logger speed traces are cross-correlated, then the GoPro
+and logger gyroscopes refine it (GPS speeds carry their own delays). The overlay shows, live:
   - lap timer: lap number, running time, live delta to the best lap so far,
     sector times, last and best lap;
   - track map with the bike's position;
@@ -30,6 +30,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 import gopro
+from imu import load_imu
 from analyze import (Projection, detect_track, fmt_lap, gate_crossings, gate_on_centerline, load_track, parse_nmea,
                      session_dynamics, track_progress)
 
@@ -102,6 +103,28 @@ def find_lag(t_log, v_log, utc_gp, v_gp) -> float:
     fine = min(np.arange(coarse - 0.1, coarse + 0.1, 0.005), key=err)
     print(f"[sync] décalage GoPro -> log {fine:+.3f} s, écart vitesse {err(fine) ** .5:.1f} km/h")
     return float(fine)
+
+
+def refine_lag_gyro(imu_t, imu_gyro_dps, gp_t, gp_gyro_rads, lag: float) -> float:
+    """Refine the offset on angular rate: GoPro gyro samples are tied to the
+    video frames at 200 Hz, while both GPS speeds carry their own processing
+    delay (about 0.1 s apart). Rotation norms are mount-independent."""
+    from imu import lowpass
+    wn = np.linalg.norm(imu_gyro_dps, axis=1)
+    gn = np.degrees(np.linalg.norm(gp_gyro_rads, axis=1))
+    grid = np.arange(max(imu_t[0], gp_t[0]) + 5, min(imu_t[-1], gp_t[-1]) - 5, 0.01)
+    if len(grid) < 3000:
+        return lag
+    o = lowpass(np.interp(grid, imu_t, wn), 100, 3)
+    g = lowpass(np.interp(grid, gp_t, gn), 100, 3)
+    lags = np.arange(lag - 0.3, lag + 0.3, 0.005)
+    cs = [np.corrcoef(o, np.interp(grid - l, grid, g))[0, 1] for l in lags]
+    i = int(np.argmax(cs))
+    if cs[i] < 0.3:
+        print(f"[sync] gyroscopes trop peu corrélés ({cs[i]:.2f}) : calage sur la vitesse gardé")
+        return lag
+    print(f"[sync] affiné sur les gyroscopes : {lags[i]:+.3f} s (corrélation {cs[i]:.2f})")
+    return float(lags[i])
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +413,7 @@ def main() -> int:
 
     # Video time of each chapter start, and its clock.
     chapters, offset = [], 0.0
-    gp_utc, gp_speed = [], []
+    gp_utc, gp_speed, gp_gt, gp_gyro = [], [], [], []
     for v in args.videos:
         tel = gopro.read_telemetry(v)
         _, _, fps, dur = gopro.video_info(v)
@@ -399,10 +422,18 @@ def main() -> int:
         ok = tel.gps_fix >= 2
         gp_utc.append(a * tel.gps_t[ok] + b)
         gp_speed.append(tel.speed_kmh[ok])
+        gp_gt.append(a * tel.gyro_t + b)
+        gp_gyro.append(tel.gyro)
         offset += dur
     total = offset
     sess = Session(args.log)
-    lag = args.lag if args.lag is not None else find_lag(sess.t, sess.speed, np.concatenate(gp_utc), np.concatenate(gp_speed))
+    if args.lag is not None:
+        lag = args.lag
+    else:
+        lag = find_lag(sess.t, sess.speed, np.concatenate(gp_utc), np.concatenate(gp_speed))
+        im = load_imu(args.log)
+        if im is not None and sum(len(g) for g in gp_gyro):
+            lag = refine_lag_gyro(im.t, im.gyro, np.concatenate(gp_gt), np.concatenate(gp_gyro), lag)
 
     def log_time(T):
         for off, dur, a, b in chapters:

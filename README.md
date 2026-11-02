@@ -66,4 +66,14 @@ Les circuits de `tools/tracks/` (tracé OpenStreetMap + position de la ligne et 
 
 Hors circuit connu et sans `--gate`, la ligne est placée au point de vitesse max (cohérent pour comparer les tours, mais pas la vraie ligne). Sorties dans `out/<log>/` : `track.png`, `lean.png` (angle sur le tracé), `laps.png` (vitesse, angle et delta vs meilleur tour en fonction de la distance), `laps.csv`, `session.csv` (chaque point : vitesse, cap, angle, accélérations), `session.gpx`.
 
+### Vidéo GoPro avec incrustation
+
+```sh
+.venv/bin/python tools/overlay.py LOG.nmea GX010325.MP4 GX020325.MP4            # session entière
+.venv/bin/python tools/overlay.py LOG.nmea GX010325.MP4 --start 600 --duration 90  # extrait
+.venv/bin/python tools/overlay.py LOG.nmea GX010325.MP4 --still 600               # image de contrôle
+```
+
+La vidéo est calée sur le log par son propre GPS (heure GPS de la GoPro, puis corrélation des vitesses : précision ~2 images). Incrustation en direct : chrono du tour, écart au meilleur tour, temps des secteurs (violet = meilleur), carte avec la position, angle (avec le max du tour), vitesse, g longitudinal. Les chapitres d'un même enregistrement (GX01…, GX02…) sont donnés dans l'ordre et raccordés ; la vidéo verticale (caméra montée de côté) est gérée. Sortie : `out/<log>/overlay.mp4`. ffmpeg est fourni par le paquet `imageio-ffmpeg`.
+
 Angle estimé depuis le GPS : `tan(angle) = v × vitesse de rotation du cap / g` (virage stabilisé, pneu fin, pilote dans l'axe). Validé sur simulation : erreur moyenne 1,2°. La moto réelle penche quelques degrés de plus (largeur du pneu), moins si le pilote se déhanche.

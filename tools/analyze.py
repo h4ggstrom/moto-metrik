@@ -497,34 +497,11 @@ def write_session_csv(path: Path, fixes: list[Fix], laps: list[Lap], lean, a_lat
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("log", type=Path)
-    ap.add_argument("--track", help="track from tools/tracks/ (default: auto-detect, 'none' to disable)")
-    ap.add_argument("--gate", help="start/finish line centre 'LAT,LON' (overrides the track; default: point of max speed)")
-    ap.add_argument("--gate-width", type=float, default=40.0, help="gate width in metres (default 40)")
-    ap.add_argument("--min-lap", type=float, default=20.0, help="ignore crossings closer than N s (default 20)")
-    ap.add_argument("--no-laps", action="store_true", help="skip lap detection")
-    ap.add_argument("--out", type=Path, default=Path("out"))
-    args = ap.parse_args()
-
-    fixes = parse_nmea(args.log)
-    # Receiver config written by the firmware at boot ($PMMK sentences).
-    with open(args.log, "r", encoding="ascii", errors="replace") as f:
-        for line in f:
-            if line.startswith("$PMMK,GNSS,") and nmea_checksum_ok(line.strip()):
-                print(f"[gps] {line.strip()[11:].split('*')[0]}")
-                break
-    if len(fixes) < 10:
-        print(f"Only {len(fixes)} valid fixes in {args.log} - nothing to analyse.", file=sys.stderr)
-        return 1
-
+def session_dynamics(log: Path, fixes: list[Fix]):
+    """Lean (deg, + = right), lateral and longitudinal g at each fix: from the
+    IMU when it is logged and calibrates, else from the GPS. Prints a summary."""
     t = np.array([f.t for f in fixes])
-    lat = np.array([f.lat for f in fixes])
-    lon = np.array([f.lon for f in fixes])
     speed = np.array([f.speed_kmh for f in fixes])
-    proj = Projection(lat.mean(), lon.mean())
-    x, y = proj(lat, lon)
     lean, a_lat, a_lon = dynamics(t, speed, np.array([f.course for f in fixes]))
     # Poor signal (few satellites, high HDOP, data gap) gives position/course
     # jumps and absurd lean/g values: blank the dynamics around those fixes.
@@ -540,7 +517,7 @@ def main() -> int:
         print(f"[dyn] {bad.sum() / 10:.1f} s of poor signal excluded from lean/g")
     # IMU, when logged and rigidly mounted: replaces the GPS-derived dynamics.
     lean_gps = lean.copy()
-    imu = load_imu(args.log)
+    imu = load_imu(log)
     if imu is not None:
         course = np.array([f.course for f in fixes], dtype=float)
         ok_c = np.isfinite(course)
@@ -570,6 +547,38 @@ def main() -> int:
         print(f"[dyn] {implausible.sum() / 10:.1f} s of implausible lean (>62 deg) excluded")
         lean[implausible] = np.nan
         a_lat[implausible] = np.nan
+    return lean, a_lat, a_lon
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("log", type=Path)
+    ap.add_argument("--track", help="track from tools/tracks/ (default: auto-detect, 'none' to disable)")
+    ap.add_argument("--gate", help="start/finish line centre 'LAT,LON' (overrides the track; default: point of max speed)")
+    ap.add_argument("--gate-width", type=float, default=40.0, help="gate width in metres (default 40)")
+    ap.add_argument("--min-lap", type=float, default=20.0, help="ignore crossings closer than N s (default 20)")
+    ap.add_argument("--no-laps", action="store_true", help="skip lap detection")
+    ap.add_argument("--out", type=Path, default=Path("out"))
+    args = ap.parse_args()
+
+    fixes = parse_nmea(args.log)
+    # Receiver config written by the firmware at boot ($PMMK sentences).
+    with open(args.log, "r", encoding="ascii", errors="replace") as f:
+        for line in f:
+            if line.startswith("$PMMK,GNSS,") and nmea_checksum_ok(line.strip()):
+                print(f"[gps] {line.strip()[11:].split('*')[0]}")
+                break
+    if len(fixes) < 10:
+        print(f"Only {len(fixes)} valid fixes in {args.log} - nothing to analyse.", file=sys.stderr)
+        return 1
+
+    t = np.array([f.t for f in fixes])
+    lat = np.array([f.lat for f in fixes])
+    lon = np.array([f.lon for f in fixes])
+    speed = np.array([f.speed_kmh for f in fixes])
+    proj = Projection(lat.mean(), lon.mean())
+    x, y = proj(lat, lon)
+    lean, a_lat, a_lon = session_dynamics(args.log, fixes)
 
     dts = np.diff(t)
     period = np.median(dts)

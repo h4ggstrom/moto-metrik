@@ -83,6 +83,7 @@ class HudState:
     lean_max: tuple  # (left, right) max of the lap
     g_lon: float  # + = throttle, - = brake
     progress: float  # 0..1 along the lap
+    pos: tuple | None = None  # bike position, metres, same frame as the centerline
 
 
 class Hud:
@@ -255,9 +256,17 @@ class Hud:
             d = (b - a) / (np.linalg.norm(b - a) + 1e-9)
             nrm = np.array([-d[1], d[0]]) * 14
             c.drawLine(*(a - nrm), *(a + nrm), self.paint(RED if j == 0 else WHITE, 4))
-        # bike
-        i = min(idx(st.progress), len(P) - 1)
-        bx, by = P[i]
+        # bike: real position when known, else interpolated along the centerline
+        # (centerline vertices are ~13 m apart: snapping to them stutters)
+        if st.pos is not None:
+            bx, by = ox + st.pos[0] * k, oy - st.pos[1] * k
+        else:
+            f = (st.progress + self.finish_frac) % 1.0
+            i = min(int(np.searchsorted(self.cum, f)), len(P) - 1)
+            i0 = max(i - 1, 0)
+            u = (f - self.cum[i0]) / max(self.cum[i] - self.cum[i0], 1e-9)
+            bx = P[i0][0] + u * (P[i % len(P)][0] - P[i0][0])
+            by = P[i0][1] + u * (P[i % len(P)][1] - P[i0][1])
         glow = self.paint(rgba("#ffcc1a", 0.45))
         glow.setMaskFilter(skia.MaskFilter.MakeBlur(skia.kNormal_BlurStyle, 8))
         c.drawCircle(bx, by, 16, glow)

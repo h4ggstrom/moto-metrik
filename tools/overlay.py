@@ -449,7 +449,7 @@ class HudOverlay:
             lap=max(st["lap_no"], 0), lap_time=st["elapsed"] or 0.0, delta=st["delta"], best=st["best"], last=st["last"],
             ideal=st["ideal"], sectors=(st["sectors"] + [None] * n_sec)[:n_sec], sector_status=st["sec_status"],
             micro=st["micro"], speed=st["speed"], lean=st["lean"], lean_max=st["lmax"], g_lon=st["g"],
-            progress=st["progress"])
+            progress=st["progress"], pos=(st["x"], st["y"]))
         return Image.fromarray(self.hud.render(hs), "RGBA")
 
 

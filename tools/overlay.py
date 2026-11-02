@@ -34,7 +34,8 @@ from imu import load_imu
 from analyze import (Projection, detect_track, fmt_lap, gate_crossings, gate_on_centerline, load_track, parse_nmea,
                      session_dynamics, track_progress)
 
-FPS = 30000 / 1001  # overlay refresh; the video keeps its own frame rate
+FPS = 30000 / 1001
+MICRO = 8  # micro-sectors per sector  # overlay refresh; the video keeps its own frame rate
 MARGIN = 40
 
 FONT_DIR = Path("/usr/share/fonts/truetype")
@@ -167,6 +168,14 @@ class Session:
             secs = None if None in marks else list(np.diff(marks))
             self.laps.append((a, b, secs))
         self.ref = [self._lap_curve(a, b) for a, b, _ in self.laps]
+        # Micro-sectors: each sector split in MICRO equal parts (lap distance).
+        edges = [0.0] + list(self.track.get("sectors_m", [])) + [self.length]
+        self.micro_b = np.concatenate([np.linspace(a, b, MICRO + 1)[:-1] for a, b in zip(edges, edges[1:])] + [[self.length]])
+        # Elapsed time at each micro boundary, per started lap (k = 1..)
+        starts = list(self.sf)
+        ends = list(self.sf[1:]) + [self.t[-1]]
+        self.micro_t = [np.interp(self.micro_b, *self._lap_curve(a, b)) if b > a else None for a, b in zip(starts, ends)]
+        self.micro_reach = [self._lap_curve(a, b)[0][-1] if b > a else 0 for a, b in zip(starts, ends)]
         # Lean drawn with a little smoothing; NaN (slow) shown as upright.
         self.lean_f = np.nan_to_num(self.lean)
         self.lean_max = []  # per completed/ongoing lap: (max left, max right)
@@ -224,6 +233,31 @@ class Session:
                 s_now -= self.length
             if 30 < s_now < s_ref[-1]:
                 st["delta"] = st["elapsed"] - float(np.interp(s_now, s_ref, t_ref))
+        # Micro-sectors and sectors of the current lap: purple = best so far in
+        # the session, green = better than the best lap, grey = slower.
+        st["micro"] = [None] * (len(self.micro_b) - 1)
+        st["sec_status"] = [None] * self.n_sec
+        if k:
+            mt = self.micro_t[k - 1]
+            prev = [self.micro_t[i] for i in range(len(done))]
+            durs_prev = np.array([np.diff(p) for p in prev]) if prev else None
+            best_lap_i = min(range(len(done)), key=lambda i: done[i][1] - done[i][0]) if done else None
+            for j in range(len(st["micro"])):
+                if mt is None or mt[j + 1] > st["elapsed"] or self.micro_b[j + 1] > self.micro_reach[k - 1] + 1:
+                    break
+                d = mt[j + 1] - mt[j]
+                if durs_prev is None or d <= durs_prev[:, j].min() + 1e-6:
+                    st["micro"][j] = "purple"
+                elif d < durs_prev[best_lap_i, j]:
+                    st["micro"][j] = "green"
+                else:
+                    st["micro"][j] = "grey"
+            for i, v in enumerate(cur):
+                b = best_sec[i]
+                ref = done[best_lap_i][2][i] if done and done[best_lap_i][2] else None
+                st["sec_status"][i] = "purple" if b is None or v <= b + 1e-6 else ("green" if ref and v < ref else "grey")
+        st["ideal"] = sum(best_sec) if best_sec and None not in best_sec else None
+        st["progress"] = float(np.interp(tl, self.t, self.prog)) / self.length
         # Max lean of the current lap so far.
         m = (self.t >= start) & (self.t <= tl)
         ln = self.lean_f[m]
@@ -396,6 +430,29 @@ class Overlay:
         d.text((bx1, by + 36), "GAZ", font=self.f_label, fill=MUTED, anchor="rs")
 
 
+class HudOverlay:
+    """Sim-racing style HUD (tools/hud.py) fed with the session state."""
+
+    def __init__(self, s: Session, w: int, h: int, show_map: bool = True):
+        import hud
+        self.hud_mod, self.s, self.W, self.H = hud, s, w, h
+        L = s.length
+        clen = float(np.sum(np.hypot(np.diff(np.append(s.ox, s.ox[0])), np.diff(np.append(s.oy, s.oy[0])))))
+        self.hud = hud.Hud(w, h, np.column_stack([s.ox, s.oy]), [d / L for d in s.track.get("sectors_m", [])],
+                           micro_frac=list(s.micro_b / L), finish_frac=s.track["finish_m"] / clen, show_map=show_map)
+
+    def frame(self, st: dict | None) -> Image.Image:
+        if st is None:
+            return Image.new("RGBA", (self.W, self.H), (0, 0, 0, 0))
+        n_sec = self.s.n_sec
+        hs = self.hud_mod.HudState(
+            lap=max(st["lap_no"], 0), lap_time=st["elapsed"] or 0.0, delta=st["delta"], best=st["best"], last=st["last"],
+            ideal=st["ideal"], sectors=(st["sectors"] + [None] * n_sec)[:n_sec], sector_status=st["sec_status"],
+            micro=st["micro"], speed=st["speed"], lean=st["lean"], lean_max=st["lmax"], g_lon=st["g"],
+            progress=st["progress"])
+        return Image.fromarray(self.hud.render(hs), "RGBA")
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -408,6 +465,8 @@ def main() -> int:
     ap.add_argument("--lag", type=float, help="force the GoPro -> log time offset (s)")
     ap.add_argument("--still", type=float, action="append", default=[], help="only write a PNG of the overlay at video time T")
     ap.add_argument("--crf", type=int, default=22, help="x264 quality (lower = better, bigger)")
+    ap.add_argument("--style", choices=["hud", "classic"], default="hud", help="hud: sim-racing style (default)")
+    ap.add_argument("--no-map", action="store_true", help="hud style: hide the track map")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
 
@@ -442,7 +501,7 @@ def main() -> int:
 
     W, H = display_size(args.videos[0])
     print(f"[video] {W}x{H}{' (vertical)' if H > W else ''}")
-    ov = Overlay(sess, W, H)
+    ov = HudOverlay(sess, W, H, show_map=not args.no_map) if args.style == "hud" else Overlay(sess, W, H)
     out = args.out or Path("out") / args.log.stem / "overlay.mp4"
     out.parent.mkdir(parents=True, exist_ok=True)
 

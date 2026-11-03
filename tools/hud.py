@@ -84,6 +84,7 @@ class HudState:
     g_lon: float  # + = throttle, - = brake
     progress: float  # 0..1 along the lap
     pos: tuple | None = None  # bike position, metres, same frame as the centerline
+    frozen: bool = False  # lap just finished, held on screen: show its final time
 
 
 class Hud:
@@ -188,14 +189,17 @@ class Hud:
     def sectors(self, c, st: HudState, x, y, w):
         h = 196
         self.panel(c, x, y, w, h)
-        rows = [(f"Tour {st.lap}", fmt_lap(st.lap_time, True)), ("Meilleur", fmt_lap(st.best)),
+        rows = [(f"Tour {st.lap}", fmt_lap(st.lap_time, not st.frozen)), ("Meilleur", fmt_lap(st.best)),
                 ("Dernier", fmt_lap(st.last)), ("Idéal", fmt_lap(st.ideal))]
         colw = (w - 48) / 2
         for i, (lab, val) in enumerate(rows):
             cx0 = x + 24 + (i % 2) * colw
             cy = y + 44 + (i // 2) * 46
             self.text(c, lab, cx0, cy, LABEL, 26, MUTED)
-            self.text(c, val, cx0 + colw - 20, cy, WIDE, 24, PURPLE if lab == "Meilleur" else WHITE, "right")
+            col = PURPLE if lab == "Meilleur" else WHITE
+            if i == 0 and st.frozen:  # finished lap: purple if new best, else green / red vs best
+                col = PURPLE if st.delta is None or st.delta <= 0 else RED
+            self.text(c, val, cx0 + colw - 20, cy, WIDE, 24, col, "right")
         # sector cells
         sy, sh = y + 116, 40
         n = len(st.sectors)

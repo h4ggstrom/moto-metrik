@@ -35,7 +35,8 @@ from analyze import (Projection, detect_track, fmt_lap, gate_crossings, gate_on_
                      session_dynamics, track_progress)
 
 FPS = 30000 / 1001
-MICRO = 8  # micro-sectors per sector  # overlay refresh; the video keeps its own frame rate
+MICRO = 8  # micro-sectors per sector
+HOLD_S = 3.0  # finished lap held on screen after the line  # overlay refresh; the video keeps its own frame rate
 MARGIN = 40
 
 FONT_DIR = Path("/usr/share/fonts/truetype")
@@ -190,6 +191,62 @@ class Session:
         s[(el > (b - a) - 10) & (s < self.length * 0.2)] += self.length
         return np.maximum.accumulate(s), el
 
+    def _timing(self, k: int, tl: float, done: list, final: bool = False) -> dict:
+        """Timing view of lap k (1-based; 0 = out-lap) at time tl, compared with
+        the completed laps `done`. final: tl is the lap's end, show it complete."""
+        out = {"lap_no": k, "elapsed": None, "sectors": [], "delta": None,
+               "micro": [None] * (len(self.micro_b) - 1), "sec_status": [None] * self.n_sec}
+        best_sec = [min((l[2][i] for l in done if l[2]), default=None) for i in range(self.n_sec)]
+        out["best_sec"] = best_sec
+        if k == 0:
+            out["sec_start"] = self.t[0]
+            return out
+        start = self.sf[k - 1]
+        out["elapsed"] = tl - start
+        # Sector times so far (all of them when the lap is complete).
+        cur, marks = [], [start]
+        nxt = self.sf[k] if k < len(self.sf) else np.inf
+        for sc in self.sec:
+            inside = sc[(sc > marks[-1]) & (sc < min(tl, nxt))]
+            if not len(inside):
+                break
+            cur.append(inside[0] - marks[-1])
+            marks.append(inside[0])
+        if final and len(cur) == self.n_sec - 1:
+            cur.append(tl - marks[-1])
+        out["sectors"], out["sec_start"] = cur, marks[-1]
+        best_i = min(range(len(done)), key=lambda i: done[i][1] - done[i][0]) if done else None
+        # Delta against the best completed lap: live, or final lap time difference.
+        if best_i is not None:
+            if final:
+                out["delta"] = out["elapsed"] - (done[best_i][1] - done[best_i][0])
+            else:
+                s_ref, t_ref = self.ref[best_i]
+                s_now = float(np.interp(tl, self.t, self.prog))
+                if out["elapsed"] < 10 and s_now > self.length * 0.8:
+                    s_now -= self.length
+                if 30 < s_now < s_ref[-1]:
+                    out["delta"] = out["elapsed"] - float(np.interp(s_now, s_ref, t_ref))
+        # Micro-sectors and sectors: purple = best so far in the session,
+        # green = better than the best lap, grey = slower.
+        mt = self.micro_t[k - 1]
+        durs_prev = np.array([np.diff(self.micro_t[i]) for i in range(len(done))]) if done else None
+        for j in range(len(out["micro"])):
+            if mt is None or (not final and (mt[j + 1] > out["elapsed"] or self.micro_b[j + 1] > self.micro_reach[k - 1] + 1)):
+                break
+            d = mt[j + 1] - mt[j]
+            if durs_prev is None or d <= durs_prev[:, j].min() + 1e-6:
+                out["micro"][j] = "purple"
+            elif d < durs_prev[best_i, j]:
+                out["micro"][j] = "green"
+            else:
+                out["micro"][j] = "grey"
+        for i, v in enumerate(cur):
+            b = best_sec[i]
+            ref = done[best_i][2][i] if done and done[best_i][2] else None
+            out["sec_status"][i] = "purple" if b is None or v <= b + 1e-6 else ("green" if ref and v < ref else "grey")
+        return out
+
     def state(self, tl: float) -> dict | None:
         if tl < self.t[0] or tl > self.t[-1]:
             return None
@@ -204,61 +261,17 @@ class Session:
         done = [l for l in self.laps if l[1] <= tl]
         st["best"] = min((b - a for a, b, _ in done), default=None)
         st["last"] = (done[-1][1] - done[-1][0]) if done else None
-        st["lap_no"] = k
-        if k == 0:
-            st["elapsed"] = None
-            start = self.t[0]
+        # Just past the line after a full lap: hold the finished lap on screen.
+        st["frozen"] = k >= 2 and tl - self.sf[k - 1] < HOLD_S
+        if st["frozen"]:
+            st.update(self._timing(k - 1, self.sf[k - 1], self.laps[:k - 2], final=True))
         else:
-            start = self.sf[k - 1]
-            st["elapsed"] = tl - start
-        # Sector times of the current lap, and best sector times so far.
+            st.update(self._timing(k, tl, done))
         best_sec = [min((l[2][i] for l in done if l[2]), default=None) for i in range(self.n_sec)]
-        cur, marks = [], [start]
-        nxt = self.sf[k] if k < len(self.sf) else np.inf
-        for sc in self.sec:
-            inside = sc[(sc > marks[-1]) & (sc < min(tl, nxt))]
-            if not len(inside):
-                break
-            cur.append(inside[0] - marks[-1])
-            marks.append(inside[0])
-        st["sectors"], st["best_sec"] = (cur if k else []), best_sec
-        st["sec_start"] = marks[-1]
-        # Live delta against the best completed lap.
-        st["delta"] = None
-        if k and done:
-            bi = min(range(len(done)), key=lambda i: done[i][1] - done[i][0])
-            s_ref, t_ref = self.ref[bi]
-            s_now = float(np.interp(tl, self.t, self.prog))
-            if st["elapsed"] < 10 and s_now > self.length * 0.8:
-                s_now -= self.length
-            if 30 < s_now < s_ref[-1]:
-                st["delta"] = st["elapsed"] - float(np.interp(s_now, s_ref, t_ref))
-        # Micro-sectors and sectors of the current lap: purple = best so far in
-        # the session, green = better than the best lap, grey = slower.
-        st["micro"] = [None] * (len(self.micro_b) - 1)
-        st["sec_status"] = [None] * self.n_sec
-        if k:
-            mt = self.micro_t[k - 1]
-            prev = [self.micro_t[i] for i in range(len(done))]
-            durs_prev = np.array([np.diff(p) for p in prev]) if prev else None
-            best_lap_i = min(range(len(done)), key=lambda i: done[i][1] - done[i][0]) if done else None
-            for j in range(len(st["micro"])):
-                if mt is None or mt[j + 1] > st["elapsed"] or self.micro_b[j + 1] > self.micro_reach[k - 1] + 1:
-                    break
-                d = mt[j + 1] - mt[j]
-                if durs_prev is None or d <= durs_prev[:, j].min() + 1e-6:
-                    st["micro"][j] = "purple"
-                elif d < durs_prev[best_lap_i, j]:
-                    st["micro"][j] = "green"
-                else:
-                    st["micro"][j] = "grey"
-            for i, v in enumerate(cur):
-                b = best_sec[i]
-                ref = done[best_lap_i][2][i] if done and done[best_lap_i][2] else None
-                st["sec_status"][i] = "purple" if b is None or v <= b + 1e-6 else ("green" if ref and v < ref else "grey")
-        st["ideal"] = sum(best_sec) if best_sec and None not in best_sec else None
+        st["ideal"] = sum(best_sec) if None not in best_sec else None
         st["progress"] = float(np.interp(tl, self.t, self.prog)) / self.length
-        # Max lean of the current lap so far.
+        # Max lean of the current lap so far (the live one, even while holding).
+        start = self.sf[k - 1] if k else self.t[0]
         m = (self.t >= start) & (self.t <= tl)
         ln = self.lean_f[m]
         st["lmax"] = (float(-ln.min()) if ln.size and ln.min() < 0 else 0.0, float(ln.max()) if ln.size and ln.max() > 0 else 0.0)
@@ -449,7 +462,7 @@ class HudOverlay:
             lap=max(st["lap_no"], 0), lap_time=st["elapsed"] or 0.0, delta=st["delta"], best=st["best"], last=st["last"],
             ideal=st["ideal"], sectors=(st["sectors"] + [None] * n_sec)[:n_sec], sector_status=st["sec_status"],
             micro=st["micro"], speed=st["speed"], lean=st["lean"], lean_max=st["lmax"], g_lon=st["g"],
-            progress=st["progress"], pos=(st["x"], st["y"]))
+            progress=st["progress"], pos=(st["x"], st["y"]), frozen=st["frozen"])
         return Image.fromarray(self.hud.render(hs), "RGBA")
 
 
